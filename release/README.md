@@ -46,19 +46,44 @@ release/
 
 如果某项资源暂未打入发布包，发布说明必须写成“缺失 / 待补齐”，不能写成可用。
 
-## 3. Windows 打包命令
+当前 Tauri resources 配置包含：
+
+```text
+resources/dictionaries/*
+resources/models/*
+resources/onnxruntime/*
+```
+
+仓库当前包含 `src-tauri/resources/models/README.md` 和 `src-tauri/resources/onnxruntime/README.md` 作为资源占位说明，真实模型和动态库仍需随 Windows 发布补入。
+
+## 3. 打包与导出命令
 
 所有安装、构建、开发和打包命令都必须在正式项目仓库执行，并通过 `mise exec` 进入项目运行时。
 
-在 Windows 终端进入仓库根目录后执行：
+基础验证：
 
 ```bash
 mise trust
 mise install
 mise exec -- npm install
 mise exec -- npm run build
+mise exec -- cargo check --manifest-path src-tauri/Cargo.toml
+mise exec -- cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+在 Windows 终端进入仓库根目录后生成 Windows 安装包：
+
+```bash
 mise exec -- npm run tauri build
 ```
+
+当前 WSL 环境可生成 Linux 产物：
+
+```bash
+mise exec -- npm run tauri build -- --bundles deb
+```
+
+Windows `exe` / `msi` 需要 Windows runner，或满足 Tauri Windows 交叉编译所需工具链和依赖后另行验证。WSL 下的 `.deb` 不能替代 Windows Overlay、点击穿透、真实截图或局内流程验收。
 
 如需只验证 Rust 工程：
 
@@ -71,6 +96,14 @@ mise exec -- npm run check:rust
 ```bash
 mise exec -- npm run tauri dev
 ```
+
+生成 release 压缩包：
+
+```bash
+mise exec -- npm run release:zip
+```
+
+该脚本会输出 `release/hex-assistant-release-*.zip`，包含前端产物、发布文档、资源目录、已存在的可执行文件 / 安装包候选、`release-manifest.json` 和 `checksums.txt`。如果缺少 Windows 安装包、真实 OCR 模型或 ORT 动态库，manifest 和文档只能记录“缺失 / 待补齐”，不能写成已通过。
 
 打包产物通常位于：
 

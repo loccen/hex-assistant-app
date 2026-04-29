@@ -20,6 +20,14 @@ mise exec -- npm run build
 mise exec -- npm run check:rust
 ```
 
+生成 release 压缩包：
+
+```bash
+mise exec -- npm run release:zip
+```
+
+该命令会把 `dist/`、`docs/`、`release/`、`src-tauri/resources/`、已存在的 Tauri 可执行文件 / 安装包候选、`release-manifest.json` 和 `checksums.txt` 打进 `release/hex-assistant-release-*.zip`。如果当前环境没有 Windows `exe` / `msi`，manifest 会记录缺失状态，不能写作 Windows 发布已验收。
+
 开发运行：
 
 ```bash
@@ -31,6 +39,14 @@ Windows 发布打包：
 ```bash
 mise exec -- npm run tauri build
 ```
+
+WSL / Linux 产物验证可执行：
+
+```bash
+mise exec -- npm run tauri build -- --bundles deb
+```
+
+WSL 下成功生成的 `.deb` 只能证明 Linux 构建链路可用，不能替代 Windows `exe` / `msi`、Overlay、点击穿透或 LOL 局内验收。Windows 安装包需要 Windows runner，或满足 Tauri Windows 交叉编译所需工具链和依赖后另行记录。
 
 打包产物路径以 Tauri 构建日志为准，通常在：
 
@@ -88,6 +104,16 @@ release/
 ```
 
 发布前必须在干净 Windows 环境确认：应用不依赖源码目录、pip 包目录、`ORT_DYLIB_PATH` 或开发机上的临时资源路径。
+
+当前 Tauri resources 配置会随包携带：
+
+```text
+src-tauri/resources/dictionaries/*
+src-tauri/resources/models/*
+src-tauri/resources/onnxruntime/*
+```
+
+仓库当前只包含词库和模型 / ORT 资源说明文件，真实 `ppocrv4_rec.onnx`、`onnxruntime.dll` 及其依赖 DLL 仍需发布前补入，并在 Windows 验证记录中写明加载结果。
 
 ## 5. 运行说明
 
