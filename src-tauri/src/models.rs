@@ -37,6 +37,7 @@ impl Default for AppSettings {
             apex_lol: ApexLolSettings {
                 cache_ttl_hours: 168,
                 request_timeout_ms: 6000,
+                failed_cache_ttl_minutes: default_failed_cache_ttl_minutes(),
             },
         }
     }
@@ -73,6 +74,12 @@ pub struct OverlaySettings {
 pub struct ApexLolSettings {
     pub cache_ttl_hours: u64,
     pub request_timeout_ms: u64,
+    #[serde(default = "default_failed_cache_ttl_minutes")]
+    pub failed_cache_ttl_minutes: u64,
+}
+
+fn default_failed_cache_ttl_minutes() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -169,7 +169,7 @@ pub fn lookup_apex_lol(
         apex::ApexLookupSettings {
             cache_ttl_hours: settings.apex_lol.cache_ttl_hours,
             request_timeout_ms: settings.apex_lol.request_timeout_ms,
-            failed_cache_ttl_minutes: 5,
+            failed_cache_ttl_minutes: settings.apex_lol.failed_cache_ttl_minutes,
         },
     )
 }
@@ -178,7 +178,7 @@ pub fn lookup_apex_lol(
 pub fn build_apex_cache_report(app: AppHandle) -> Result<ApexCacheReport, String> {
     let paths = AppPaths::from_app(&app)?;
     paths.ensure_all()?;
-    apex::build_cache_report(&paths.cache)
+    apex::build_and_write_cache_report(&paths.cache, &paths.reports)
 }
 
 #[tauri::command]
