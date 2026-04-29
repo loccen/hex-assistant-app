@@ -320,6 +320,32 @@ pub fn build_release_package(
     workspace_root: &Path,
     trace_id: &str,
 ) -> Result<DiagnosticExportResult, String> {
+    let artifacts = find_windows_release_artifacts(workspace_root);
+    if artifacts.iter().all(|path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| !value.eq_ignore_ascii_case("exe"))
+            .unwrap_or(true)
+    }) {
+        return Err(
+            "未找到 Windows exe，拒绝生成看起来像交付包的 release zip。请先执行 Windows GNU 构建。"
+                .to_string(),
+        );
+    }
+
+    let resource_entries = release_resource_entries(workspace_root);
+    let missing_resources = resource_entries
+        .iter()
+        .filter(|(source, _)| !source.is_file())
+        .map(|(source, entry)| format!("{entry} <- {}", source.display()))
+        .collect::<Vec<_>>();
+    if !missing_resources.is_empty() {
+        return Err(format!(
+            "缺少 release 必需资源，拒绝生成用户包：{}",
+            missing_resources.join("; ")
+        ));
+    }
+
     let release_dir = workspace_root.join("release");
     fs::create_dir_all(&release_dir)
         .map_err(|error| format!("无法创建 release 目录 {}: {error}", release_dir.display()))?;
@@ -336,24 +362,38 @@ pub fn build_release_package(
     let mut written_entries = HashSet::new();
     let mut checksums = Vec::new();
 
-    for dir in [
-        workspace_root.join("dist"),
-        workspace_root.join("docs"),
-        workspace_root.join("release"),
-        workspace_root.join("src-tauri").join("resources"),
-    ] {
-        included_files += add_dir_to_zip_with_checksums(
+    let artifact_entries = artifacts
+        .iter()
+        .map(|path| {
+            serde_json::json!({
+                "source": path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().replace('\\', "/"),
+                "entry": release_artifact_entry_name(workspace_root, path),
+                "platform": "windows",
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let root_readme = release_root_readme();
+    included_files += add_bytes_to_zip_as(
+        &mut zip,
+        b"README.txt",
+        root_readme.as_bytes(),
+        options,
+        &mut written_entries,
+        &mut checksums,
+    )?;
+
+    for (source, entry_name) in resource_entries {
+        included_files += add_file_to_zip_as(
             &mut zip,
-            workspace_root,
-            &dir,
-            &zip_path,
+            &source,
+            &entry_name,
             options,
             &mut written_entries,
             &mut checksums,
         )?;
     }
 
-    let artifacts = find_release_artifacts(workspace_root);
     for artifact in &artifacts {
         let entry_name = release_artifact_entry_name(workspace_root, artifact);
         included_files += add_file_to_zip_as(
@@ -369,26 +409,32 @@ pub fn build_release_package(
     let manifest = serde_json::json!({
         "traceId": trace_id,
         "generatedAt": Utc::now().to_rfc3339(),
-        "packageKind": "development-release-bundle",
+        "packageKind": "user-release-bundle",
         "sourceCommit": current_git_commit(workspace_root),
         "hostOs": std::env::consts::OS,
         "hostArch": std::env::consts::ARCH,
-        "artifacts": artifacts
-            .iter()
-            .map(|path| path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().replace('\\', "/"))
-            .collect::<Vec<_>>(),
-        "windowsInstaller": find_windows_bundle(workspace_root),
+        "target": "x86_64-pc-windows-gnu",
+        "windowsOnly": true,
+        "buildCommands": [
+            "mise exec -- npm run build",
+            "mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu"
+        ],
+        "artifacts": artifact_entries,
+        "windowsPackageStatus": {
+            "included": true,
+            "reason": "本包为 Windows-only 用户包，包含 x86_64-pc-windows-gnu 构建出的 exe；仍需在真实 Windows 桌面环境验收启动、OCR 加载、Overlay 和局内流程。"
+        },
         "resourceInventory": release_resource_inventory(workspace_root),
         "includedSections": [
-            "dist",
-            "docs",
-            "release",
-            "src-tauri/resources",
-            "packages"
+            "README.txt",
+            "hex-assistant-app.exe",
+            "WebView2Loader.dll",
+            "resources",
+            "checksums.txt",
+            "release-manifest.json"
         ],
         "notes": [
-            "当前 WSL 环境可生成 Linux 产物；Windows exe/msi 需要 Windows runner 或满足 Tauri 交叉编译条件。",
-            "如果没有 Windows Tauri 打包产物，此压缩包会保留资源说明、README、已知限制、诊断包导出说明和验证记录，但不能写作 Windows 发布已验收。",
+            "release zip 不包含 dist/、docs/、Linux installers 或源码目录；Windows exe 是交付主体。",
             "真实 Windows 截图、Overlay 点击穿透、OCR 模型加载和 ORT 动态库加载仍需在 Windows 桌面验收。"
         ]
     });
@@ -541,43 +587,6 @@ fn add_dir_to_zip(
     Ok(included)
 }
 
-fn add_dir_to_zip_with_checksums(
-    zip: &mut zip::ZipWriter<File>,
-    root: &Path,
-    dir: &Path,
-    current_zip: &Path,
-    options: SimpleFileOptions,
-    written_entries: &mut HashSet<String>,
-    checksums: &mut Vec<(String, String)>,
-) -> Result<usize, String> {
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    let mut included = 0usize;
-    for entry in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
-        let path = entry.path();
-        if !path.is_file() || should_skip_release_input(path, current_zip) {
-            continue;
-        }
-
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|error| format!("无法计算 release 相对路径 {}: {error}", path.display()))?;
-        let relative_name = relative.to_string_lossy().replace('\\', "/");
-        included += add_file_to_zip_as(
-            zip,
-            path,
-            &relative_name,
-            options,
-            written_entries,
-            checksums,
-        )?;
-    }
-
-    Ok(included)
-}
-
 fn add_file_to_zip_as(
     zip: &mut zip::ZipWriter<File>,
     path: &Path,
@@ -622,41 +631,73 @@ fn add_bytes_to_zip_as(
     Ok(1)
 }
 
-fn should_skip_release_input(path: &Path, current_zip: &Path) -> bool {
-    if path == current_zip {
-        return true;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    file_name.starts_with("hex-assistant-release-")
-        && path.extension().and_then(|value| value.to_str()) == Some("zip")
+fn release_root_readme() -> String {
+    [
+        "LOL 海克斯助手 Windows 用户包",
+        "",
+        "运行方式：",
+        "1. 解压整个 zip，不要只单独复制 exe。",
+        "2. 双击 hex-assistant-app.exe 启动。",
+        "3. 首次使用前确认 LOL 使用无边框模式，并在应用内完成截图区域校准。",
+        "",
+        "包内资源：",
+        "- 已包含 PP-OCRv4 rec 模型：resources/models/ppocrv4_rec.onnx",
+        "- 已包含 ONNX Runtime：resources/onnxruntime/onnxruntime.dll",
+        "- 已包含 ONNX Runtime 共享库：resources/onnxruntime/onnxruntime_providers_shared.dll",
+        "- 已包含海克斯词库：resources/dictionaries/augments.zh-CN.json",
+        "",
+        "诊断包导出：",
+        "- 应用内使用“导出诊断包”或“导出 release”相关按钮生成诊断材料。",
+        "- 反馈问题时保留日志、截图样本、OCR 报告和 release-manifest.json。",
+        "",
+        "仍需 Windows 真实验收：",
+        "- 在真实 Windows 桌面启动本 exe。",
+        "- 确认 ppocrv4_rec.onnx 和 onnxruntime.dll 从本包资源目录加载。",
+        "- 确认 Overlay 透明、置顶、不抢焦点、点击穿透。",
+        "- 确认 LOL 无边框模式下真实截图、OCR 和局内流程可用。",
+        "",
+    ]
+    .join("\n")
 }
 
-fn find_release_artifacts(workspace_root: &Path) -> Vec<PathBuf> {
+fn release_resource_entries(workspace_root: &Path) -> Vec<(PathBuf, String)> {
+    let resources = workspace_root.join("src-tauri").join("resources");
+    vec![
+        (
+            resources.join("dictionaries").join("augments.zh-CN.json"),
+            "resources/dictionaries/augments.zh-CN.json".to_string(),
+        ),
+        (
+            resources.join("models").join("ppocrv4_rec.onnx"),
+            "resources/models/ppocrv4_rec.onnx".to_string(),
+        ),
+        (
+            resources.join("onnxruntime").join("onnxruntime.dll"),
+            "resources/onnxruntime/onnxruntime.dll".to_string(),
+        ),
+        (
+            resources
+                .join("onnxruntime")
+                .join("onnxruntime_providers_shared.dll"),
+            "resources/onnxruntime/onnxruntime_providers_shared.dll".to_string(),
+        ),
+    ]
+}
+
+fn find_windows_release_artifacts(workspace_root: &Path) -> Vec<PathBuf> {
     let mut artifacts = Vec::new();
     let target_release = workspace_root
         .join("src-tauri")
         .join("target")
+        .join("x86_64-pc-windows-gnu")
         .join("release");
     for candidate in [
-        target_release.join("hex-assistant-app"),
         target_release.join("hex-assistant-app.exe"),
         target_release.join("LOL 海克斯助手.exe"),
+        target_release.join("WebView2Loader.dll"),
     ] {
         if candidate.is_file() {
             artifacts.push(candidate);
-        }
-    }
-
-    let bundle_dir = target_release.join("bundle");
-    if bundle_dir.exists() {
-        for entry in WalkDir::new(bundle_dir).into_iter().filter_map(Result::ok) {
-            let path = entry.into_path();
-            if path.is_file() && is_release_artifact(&path) {
-                artifacts.push(path);
-            }
         }
     }
 
@@ -665,65 +706,27 @@ fn find_release_artifacts(workspace_root: &Path) -> Vec<PathBuf> {
     artifacts
 }
 
-fn is_release_artifact(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
-            .as_deref(),
-        Some("exe" | "msi" | "msix" | "appx" | "deb" | "rpm" | "appimage" | "dmg" | "zip")
-    )
-}
-
-fn release_artifact_entry_name(workspace_root: &Path, artifact: &Path) -> String {
-    let bundle_dir = workspace_root
-        .join("src-tauri")
-        .join("target")
-        .join("release")
-        .join("bundle");
-    if let Ok(relative) = artifact.strip_prefix(&bundle_dir) {
-        return format!(
-            "packages/bundle/{}",
-            relative.to_string_lossy().replace('\\', "/")
-        );
-    }
-
+fn release_artifact_entry_name(_workspace_root: &Path, artifact: &Path) -> String {
     let file_name = artifact
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("artifact");
-    format!("packages/{file_name}")
+    file_name.to_string()
 }
 
 fn release_resource_inventory(workspace_root: &Path) -> serde_json::Value {
-    let resources = workspace_root.join("src-tauri").join("resources");
+    let packaged_resources = release_resource_entries(workspace_root)
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect::<Vec<_>>();
     serde_json::json!({
-        "dictionaries": list_relative_files(&resources, &resources.join("dictionaries")),
-        "models": list_relative_files(&resources, &resources.join("models")),
-        "onnxruntime": list_relative_files(&resources, &resources.join("onnxruntime")),
+        "packagedResources": packaged_resources,
         "requiredRuntimeNotes": [
-            "PP-OCRv4 rec ONNX 模型需随包放入 resources/models。",
-            "Windows ORT 动态库需随包放入 resources/onnxruntime，至少包含 onnxruntime.dll。",
-            "当前 README 文件是资源占位和获取说明，不等同于真实模型或动态库。"
+            "PP-OCRv4 rec ONNX 模型应随包放入 resources/models。",
+            "Windows ORT 动态库应随包放入 resources/onnxruntime，至少包含 onnxruntime.dll。",
+            "当前用户包只包含运行必需资源；Windows 真实加载仍需单独验收。"
         ]
     })
-}
-
-fn list_relative_files(root: &Path, dir: &Path) -> Vec<String> {
-    if !dir.exists() {
-        return Vec::new();
-    }
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|entry| entry.into_path())
-        .filter(|path| path.is_file())
-        .filter_map(|path| {
-            path.strip_prefix(root)
-                .ok()
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        })
-        .collect()
 }
 
 fn current_git_commit(workspace_root: &Path) -> Option<String> {
@@ -755,28 +758,6 @@ fn workspace_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn find_windows_bundle(workspace_root: &Path) -> Option<PathBuf> {
-    let bundle_dir = workspace_root
-        .join("src-tauri")
-        .join("target")
-        .join("release")
-        .join("bundle");
-    if !bundle_dir.exists() {
-        return None;
-    }
-    WalkDir::new(bundle_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .map(|entry| entry.into_path())
-        .find(|path| {
-            path.is_file()
-                && matches!(
-                    path.extension().and_then(|value| value.to_str()),
-                    Some("exe" | "msi" | "nsis")
-                )
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,24 +767,88 @@ mod tests {
     fn release_package_contains_valid_manifest_json() {
         let workspace = temp_workspace("release-package");
         fs::create_dir_all(workspace.join("dist")).expect("应能创建 dist");
-        fs::create_dir_all(workspace.join("docs")).expect("应能创建 docs");
-        fs::create_dir_all(workspace.join("release")).expect("应能创建 release");
         fs::create_dir_all(workspace.join("src-tauri").join("resources").join("models"))
             .expect("应能创建 resources");
-        fs::write(workspace.join("dist").join("index.html"), "<main></main>\n")
-            .expect("应能写入前端产物");
-        fs::write(workspace.join("docs").join("README.md"), "# docs\n").expect("应能写入文档");
-        fs::write(workspace.join("release").join("README.md"), "# release\n")
-            .expect("应能写入 release 文档");
+        fs::create_dir_all(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("dictionaries"),
+        )
+        .expect("应能创建 dictionaries");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("dictionaries")
+                .join("augments.zh-CN.json"),
+            "[]\n",
+        )
+        .expect("应能写入词库");
         fs::write(
             workspace
                 .join("src-tauri")
                 .join("resources")
                 .join("models")
-                .join("README.md"),
-            "# models\n",
+                .join("ppocrv4_rec.onnx"),
+            b"model",
         )
-        .expect("应能写入资源说明");
+        .expect("应能写入模型");
+        fs::create_dir_all(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("onnxruntime"),
+        )
+        .expect("应能创建 onnxruntime");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("onnxruntime")
+                .join("onnxruntime.dll"),
+            b"ort",
+        )
+        .expect("应能写入 ORT DLL");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("onnxruntime")
+                .join("onnxruntime_providers_shared.dll"),
+            b"provider",
+        )
+        .expect("应能写入 ORT provider DLL");
+        fs::create_dir_all(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release"),
+        )
+        .expect("应能创建 Windows target 目录");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release")
+                .join("hex-assistant-app.exe"),
+            b"exe",
+        )
+        .expect("应能写入 Windows exe");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release")
+                .join("WebView2Loader.dll"),
+            b"webview",
+        )
+        .expect("应能写入 WebView2Loader.dll");
+        fs::write(workspace.join("dist").join("index.html"), "<main></main>\n")
+            .expect("应能写入前端产物");
 
         let result =
             build_release_package(&workspace, "release-test").expect("应能生成 release 包");
@@ -823,11 +868,20 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&manifest_content).expect("manifest 应为合法 JSON");
         assert_eq!(manifest["traceId"], "release-test");
-        assert_eq!(manifest["packageKind"], "development-release-bundle");
-        assert!(archive.by_name("dist/index.html").is_ok());
+        assert_eq!(manifest["packageKind"], "user-release-bundle");
+        assert_eq!(manifest["windowsOnly"], true);
+        assert!(archive.by_name("README.txt").is_ok());
+        assert!(archive.by_name("hex-assistant-app.exe").is_ok());
+        assert!(archive.by_name("WebView2Loader.dll").is_ok());
+        assert!(archive.by_name("resources/models/ppocrv4_rec.onnx").is_ok());
         assert!(archive
-            .by_name("src-tauri/resources/models/README.md")
+            .by_name("resources/onnxruntime/onnxruntime.dll")
             .is_ok());
+        assert!(archive.by_name("dist/index.html").is_err());
+        assert!(archive.by_name("docs/README.md").is_err());
+        assert!(archive
+            .by_name("installers/linux/hex-assistant-app.deb")
+            .is_err());
         assert!(archive.by_name("checksums.txt").is_ok());
 
         let _ = fs::remove_dir_all(workspace);

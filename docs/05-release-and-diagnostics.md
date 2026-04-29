@@ -2,7 +2,7 @@
 
 ## 1. 文档定位
 
-本文补齐正式项目的发布、运行、诊断和验收说明。它面向 `/home/code/hex-assistant-app`，不适用于旧 POC 仓库 `/home/code/hex-assistant`。
+本文补齐正式项目的发布、运行、诊断和验收说明。它面向当前正式项目 worktree，不适用于旧 POC 仓库 `/home/code/hex-assistant`。
 
 本文只描述应如何发布和验收，不把尚未真实执行的 Windows 局内测试写成已通过。当前 WSL 环境可以做文档检查、前端构建和部分静态检查，但不能真实验收 Windows Overlay、点击穿透、LOL 截图、OCR 局内闭环和完整端到端流程。
 
@@ -23,10 +23,12 @@ mise exec -- npm run check:rust
 生成 release 压缩包：
 
 ```bash
+mise exec -- npm run build
+mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu
 mise exec -- npm run release:zip
 ```
 
-该命令会把 `dist/`、`docs/`、`release/`、`src-tauri/resources/`、已存在的 Tauri 可执行文件 / 安装包候选、`release-manifest.json` 和 `checksums.txt` 打进 `release/hex-assistant-release-*.zip`。如果当前环境没有 Windows `exe` / `msi`，manifest 会记录缺失状态，不能写作 Windows 发布已验收。
+该命令会生成面向用户的 `release/hex-assistant-release-*.zip`，结构只包含 Windows 可执行文件、`WebView2Loader.dll`、`resources/` OCR / ORT 资源、`README.txt`、`release-manifest.json` 和 `checksums.txt`。release zip 不包含 `dist/`、`docs/`、Linux installers、deb/rpm/appimage 或源码。如果当前环境没有 Windows exe，脚本会失败并拒绝生成用户包。
 
 开发运行：
 
@@ -34,25 +36,26 @@ mise exec -- npm run release:zip
 mise exec -- npm run tauri dev
 ```
 
-Windows 发布打包：
+Windows GNU 发布构建：
 
 ```bash
-mise exec -- npm run tauri build
+mise exec -- npm run build:windows
 ```
 
-WSL / Linux 产物验证可执行：
+等价的拆分命令：
 
 ```bash
-mise exec -- npm run tauri build -- --bundles deb
+mise exec -- npm run build
+mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu
 ```
 
-WSL 下成功生成的 `.deb` 只能证明 Linux 构建链路可用，不能替代 Windows `exe` / `msi`、Overlay、点击穿透或 LOL 局内验收。Windows 安装包需要 Windows runner，或满足 Tauri Windows 交叉编译所需工具链和依赖后另行记录。
+本项目最终交付只发布 Windows 用户包。不要把 Linux 产物、前端源码、`dist/` 或长文档目录打进用户 zip。
 
-打包产物路径以 Tauri 构建日志为准，通常在：
+Windows GNU 构建产物通常在：
 
 ```text
-src-tauri/target/release/
-src-tauri/target/release/bundle/
+src-tauri/target/x86_64-pc-windows-gnu/release/hex-assistant-app.exe
+src-tauri/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll
 ```
 
 文档改动至少执行：
@@ -81,26 +84,28 @@ git diff --check
 
 发布包应包含：
 
-- Windows 可执行文件或安装包，例如 `*.exe`、`*.msi` 或 `*setup.exe`。
-- PP-OCRv4 rec ONNX 模型和必要的字典 / 元数据。
-- ONNX Runtime Windows 动态库，例如 `onnxruntime.dll`。
-- 运行说明。
-- 已知限制。
-- 诊断包导出说明。
-- 验证记录。
-- 产物校验值。
+- Windows 可执行文件，例如 `hex-assistant-app.exe`。
+- `WebView2Loader.dll`。
+- PP-OCRv4 rec ONNX 模型、海克斯词库和 Windows ONNX Runtime 动态库。
+- 不超过 80 行的 `README.txt`。
+- `release-manifest.json` 和 `checksums.txt`。
 
 建议发布目录：
 
 ```text
-release/
-  README.md
-  验证记录.md
-  packages/
+README.txt
+hex-assistant-app.exe
+WebView2Loader.dll
+resources/
+  dictionaries/
+    augments.zh-CN.json
   models/
-  runtime/
-  docs/
-  diagnostics/
+    ppocrv4_rec.onnx
+  onnxruntime/
+    onnxruntime.dll
+    onnxruntime_providers_shared.dll
+checksums.txt
+release-manifest.json
 ```
 
 发布前必须在干净 Windows 环境确认：应用不依赖源码目录、pip 包目录、`ORT_DYLIB_PATH` 或开发机上的临时资源路径。
@@ -113,7 +118,7 @@ src-tauri/resources/models/*
 src-tauri/resources/onnxruntime/*
 ```
 
-仓库当前只包含词库和模型 / ORT 资源说明文件，真实 `ppocrv4_rec.onnx`、`onnxruntime.dll` 及其依赖 DLL 仍需发布前补入，并在 Windows 验证记录中写明加载结果。
+仓库当前已在 Tauri resources 中随包包含 `ppocrv4_rec.onnx`、Windows x64 ONNX Runtime 1.25.0 `onnxruntime.dll`、包内 `onnxruntime_providers_shared.dll`、ONNX Runtime LICENSE 和 ThirdPartyNotices。Windows 真实启动、模型加载和动态库加载仍需在干净 Windows 桌面环境单独验收，并在验证记录中写明加载结果。
 
 ## 5. 运行说明
 

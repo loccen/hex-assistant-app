@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "check:rust": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "build:windows": "npm run build && cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu",
+    "build:windows-gnu": "npm run build:windows",
     "release:zip": "cargo run --manifest-path src-tauri/Cargo.toml --example export-release",
     "preview": "vite preview",
     "tauri": "tauri"

@@ -8,6 +8,12 @@ src-tauri/resources/models/ppocrv4_rec.onnx
 
 模块启动推理前会先检查文件是否存在。文件缺失时不会静默降级，会返回包含完整路径的 `HEX-OCR-MODEL-MISSING` / `ModelMissing` 错误；离线文本回放命令仍可继续用于验证词库匹配和报告结构。
 
+当前仓库已放入本机 RapidOCR 安装包提供的 PP-OCRv4 rec ONNX 模型，并按正式资源路径命名为：
+
+```text
+src-tauri/resources/models/ppocrv4_rec.onnx
+```
+
 海克斯名称词库必须放在：
 
 ```text
