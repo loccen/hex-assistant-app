@@ -1,16 +1,25 @@
+use crate::apex;
 use crate::app_paths::AppPaths;
+use crate::calibration;
+use crate::capture;
+use crate::live_client::LiveClientDataApi;
 use crate::models::{
     DiagnosticExportResult, HealthCheckItem, HealthCheckReport, HealthStatus, RuntimeOverview,
     TelemetryEvent, TelemetryEventInput,
 };
+use crate::ocr;
+use crate::overlay::{self, OverlayAnchor, OverlayRect};
 use crate::settings::load_or_create_settings;
+use crate::state_machine::{
+    AssistantStateMachine, AugmentChoice, LivePlayerSnapshot, PanelState, StateMachineInput,
+};
 use crate::telemetry::{append_event, new_trace_id, write_event};
 use chrono::Utc;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
@@ -80,12 +89,44 @@ pub fn health_check(app: &AppHandle) -> Result<HealthCheckReport, String> {
         details: format!("写入 {}", paths.app_log_path().display()),
         error_code: None,
     });
+    let capture_samples_dir = capture::capture_samples_dir(&paths.root);
+    items.push(HealthCheckItem {
+        key: "capture-command".to_string(),
+        name: "截图样本采集".to_string(),
+        status: HealthStatus::NotChecked,
+        details: format!(
+            "命令已接入；健康检查不主动截屏，样本目录 {}",
+            capture_samples_dir.display()
+        ),
+        error_code: None,
+    });
+    let calibration_path = calibration::calibration_config_path(&paths.root);
+    items.push(HealthCheckItem {
+        key: "calibration".to_string(),
+        name: "屏幕校准配置".to_string(),
+        status: if calibration_path.exists() {
+            HealthStatus::Pass
+        } else {
+            HealthStatus::Warn
+        },
+        details: if calibration_path.exists() {
+            format!("已找到 {}", calibration_path.display())
+        } else {
+            format!("尚未保存校准配置 {}", calibration_path.display())
+        },
+        error_code: (!calibration_path.exists()).then(|| "HEX-CALIBRATION-MISSING".to_string()),
+    });
+    let ocr_status = ocr::check_ppocr_resources(resource_root(app));
     items.push(HealthCheckItem {
         key: "ocr-model".to_string(),
         name: "OCR 模型文件".to_string(),
-        status: HealthStatus::Warn,
-        details: "阶段 4 接入 PP-OCRv4 rec ONNX；当前只检查资源目录规划".to_string(),
-        error_code: Some("HEX-OCR-RESOURCE-PENDING".to_string()),
+        status: if ocr_status.ready {
+            HealthStatus::Pass
+        } else {
+            HealthStatus::Warn
+        },
+        details: ocr_status.message,
+        error_code: ocr_status.error_code,
     });
     items.push(HealthCheckItem {
         key: "ort-runtime".to_string(),
@@ -98,21 +139,59 @@ pub fn health_check(app: &AppHandle) -> Result<HealthCheckReport, String> {
         key: "live-client".to_string(),
         name: "Live Client Data API".to_string(),
         status: HealthStatus::NotChecked,
-        details: "阶段 5 接入本地只读接口健康检查；阶段 1 不访问游戏接口".to_string(),
+        details: format!(
+            "只读接口命令已接入；健康检查不主动访问 {}",
+            LiveClientDataApi::new().active_player_url()
+        ),
         error_code: None,
     });
+    let state_machine_report = run_state_machine_self_check();
+    items.push(state_machine_report);
+    let apex_cache_report = apex::build_cache_report(&paths.cache);
     items.push(HealthCheckItem {
         key: "apex-lol".to_string(),
-        name: "ApexLOL 网络可达性".to_string(),
-        status: HealthStatus::NotChecked,
-        details: "阶段 8 接入来源查询健康检查；阶段 1 不请求 ApexLOL".to_string(),
+        name: "ApexLOL 缓存".to_string(),
+        status: if apex_cache_report.is_ok() {
+            HealthStatus::Pass
+        } else {
+            HealthStatus::Fail
+        },
+        details: match apex_cache_report {
+            Ok(report) => format!(
+                "缓存报告可生成；总条目 {}，失败条目 {}，健康检查不请求 ApexLOL 网络",
+                report.total_entries, report.failed_entries
+            ),
+            Err(error) => format!("ApexLOL 缓存报告生成失败: {error}"),
+        },
         error_code: None,
     });
+    let overlay_plan = overlay::plan_overlay_bounds(
+        OverlayRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        },
+        OverlayAnchor::TopRight,
+        360,
+        96,
+        i32::try_from(settings.overlay.gap).unwrap_or(8),
+    );
     items.push(HealthCheckItem {
         key: "overlay".to_string(),
         name: "Overlay 能力".to_string(),
-        status: HealthStatus::NotChecked,
-        details: "阶段 7 接入透明置顶点击穿透窗口检查；真实验收必须在 Windows 桌面完成".to_string(),
+        status: if overlay_plan.is_ok() {
+            HealthStatus::Pass
+        } else {
+            HealthStatus::Fail
+        },
+        details: match overlay_plan {
+            Ok(bounds) => format!(
+                "几何规划可用 {}x{} @ {},{}；真实透明置顶与点击穿透需在 Windows 桌面验收",
+                bounds.width, bounds.height, bounds.x, bounds.y
+            ),
+            Err(error) => format!("Overlay 几何规划失败: {error}"),
+        },
         error_code: None,
     });
 
@@ -179,7 +258,7 @@ pub fn export_diagnostic_package(app: &AppHandle) -> Result<DiagnosticExportResu
         .map_err(|error| format!("无法完成诊断包写入: {error}"))?;
 
     let result = DiagnosticExportResult {
-        trace_id: trace_id.clone(),
+        trace_id: trace_id.to_string(),
         zip_path: zip_path.clone(),
         included_files,
     };
@@ -196,6 +275,133 @@ pub fn export_diagnostic_package(app: &AppHandle) -> Result<DiagnosticExportResu
     write_event(&paths, event)?;
 
     Ok(result)
+}
+
+pub fn export_release_package(app: &AppHandle) -> Result<DiagnosticExportResult, String> {
+    let start = Instant::now();
+    let paths = AppPaths::from_app(app)?;
+    paths.ensure_all()?;
+    let trace_id = new_trace_id("release");
+    let workspace_root = workspace_root();
+    let result = build_release_package(&workspace_root, &trace_id)?;
+
+    write_event(
+        &paths,
+        TelemetryEventInput {
+            stage: "release-export".to_string(),
+            input_summary: "生成 release 压缩包".to_string(),
+            output_summary: format!(
+                "{}，文件数 {}",
+                result.zip_path.display(),
+                result.included_files
+            ),
+            duration_ms: start.elapsed().as_millis(),
+            level: "info".to_string(),
+            error_code: None,
+            message: format!("release 压缩包生成完成 trace_id={trace_id}"),
+        },
+    )?;
+
+    Ok(result)
+}
+
+fn build_release_package(
+    workspace_root: &Path,
+    trace_id: &str,
+) -> Result<DiagnosticExportResult, String> {
+    let release_dir = workspace_root.join("release");
+    fs::create_dir_all(&release_dir)
+        .map_err(|error| format!("无法创建 release 目录 {}: {error}", release_dir.display()))?;
+    let zip_path = release_dir.join(format!(
+        "hex-assistant-release-{}.zip",
+        timestamp_for_filename()
+    ));
+
+    let zip_file = File::create(&zip_path)
+        .map_err(|error| format!("无法创建 release 压缩包 {}: {error}", zip_path.display()))?;
+    let mut zip = zip::ZipWriter::new(zip_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut included_files = 0usize;
+
+    for dir in [
+        workspace_root.join("dist"),
+        workspace_root.join("docs"),
+        workspace_root.join("release"),
+        workspace_root.join("src-tauri").join("resources"),
+    ] {
+        included_files += add_dir_to_zip(&mut zip, workspace_root, &dir, &zip_path, options)?;
+    }
+
+    let manifest = serde_json::json!({
+        "traceId": trace_id,
+        "generatedAt": Utc::now().to_rfc3339(),
+        "packageKind": "development-release-bundle",
+        "windowsInstaller": find_windows_bundle(workspace_root),
+        "notes": [
+            "当前环境如果没有 Windows Tauri 打包产物，此压缩包包含前端产物、资源目录和发布说明。",
+            "真实 Windows 截图、Overlay 点击穿透和 OCR 动态库加载仍需在 Windows 桌面验收。"
+        ]
+    });
+    zip.start_file("release-manifest.json", options)
+        .map_err(|error| format!("无法写入 release manifest: {error}"))?;
+    zip.write_all(
+        serde_json::to_string_pretty(&manifest)
+            .map_err(|error| format!("无法序列化 release manifest: {error}"))?
+            .as_bytes(),
+    )
+    .map_err(|error| format!("无法写入 release manifest 内容: {error}"))?;
+    included_files += 1;
+
+    zip.finish()
+        .map_err(|error| format!("无法完成 release 压缩包写入: {error}"))?;
+
+    let result = DiagnosticExportResult {
+        trace_id: trace_id.to_string(),
+        zip_path: zip_path.clone(),
+        included_files,
+    };
+
+    Ok(result)
+}
+
+fn run_state_machine_self_check() -> HealthCheckItem {
+    let mut machine = AssistantStateMachine::new();
+    let events = machine.apply(StateMachineInput {
+        player: Some(LivePlayerSnapshot {
+            champion_name: "Ahri".to_string(),
+            level: 7,
+        }),
+        panel_state: PanelState::Expanded,
+        choices: vec![
+            AugmentChoice {
+                slot: 0,
+                augment_id: "prismatic-ticket".to_string(),
+            },
+            AugmentChoice {
+                slot: 1,
+                augment_id: "build-a-bud".to_string(),
+            },
+            AugmentChoice {
+                slot: 2,
+                augment_id: "trade-sector".to_string(),
+            },
+        ],
+        selected_slot: None,
+        pause_reason: None,
+    });
+
+    HealthCheckItem {
+        key: "state-machine".to_string(),
+        name: "状态机离线模拟".to_string(),
+        status: HealthStatus::Pass,
+        details: format!(
+            "状态 {:?}，待选阶段 {:?}，事件数 {}",
+            machine.state().status,
+            machine.state().pending_tier,
+            events.len()
+        ),
+        error_code: None,
+    }
 }
 
 fn write_environment_report(paths: &AppPaths, trace_id: &str) -> Result<(), String> {
@@ -272,4 +478,102 @@ fn add_dir_to_zip(
 
 fn timestamp_for_filename() -> String {
     Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+fn resource_root(app: &AppHandle) -> PathBuf {
+    app.path()
+        .resource_dir()
+        .ok()
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| workspace_root().join("src-tauri").join("resources"))
+}
+
+fn workspace_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn find_windows_bundle(workspace_root: &Path) -> Option<PathBuf> {
+    let bundle_dir = workspace_root
+        .join("src-tauri")
+        .join("target")
+        .join("release")
+        .join("bundle");
+    if !bundle_dir.exists() {
+        return None;
+    }
+    WalkDir::new(bundle_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .find(|path| {
+            path.is_file()
+                && matches!(
+                    path.extension().and_then(|value| value.to_str()),
+                    Some("exe" | "msi" | "nsis")
+                )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn release_package_contains_valid_manifest_json() {
+        let workspace = temp_workspace("release-package");
+        fs::create_dir_all(workspace.join("dist")).expect("应能创建 dist");
+        fs::create_dir_all(workspace.join("docs")).expect("应能创建 docs");
+        fs::create_dir_all(workspace.join("release")).expect("应能创建 release");
+        fs::create_dir_all(workspace.join("src-tauri").join("resources").join("models"))
+            .expect("应能创建 resources");
+        fs::write(workspace.join("dist").join("index.html"), "<main></main>\n")
+            .expect("应能写入前端产物");
+        fs::write(workspace.join("docs").join("README.md"), "# docs\n").expect("应能写入文档");
+        fs::write(workspace.join("release").join("README.md"), "# release\n")
+            .expect("应能写入 release 文档");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("models")
+                .join("README.md"),
+            "# models\n",
+        )
+        .expect("应能写入资源说明");
+
+        let result =
+            build_release_package(&workspace, "release-test").expect("应能生成 release 包");
+        assert!(result.included_files >= 4);
+
+        let file = File::open(&result.zip_path).expect("应能打开 release 包");
+        let mut archive = zip::ZipArchive::new(file).expect("应能读取 release zip");
+        let mut manifest_file = archive
+            .by_name("release-manifest.json")
+            .expect("应包含 release manifest");
+        let mut manifest_content = String::new();
+        manifest_file
+            .read_to_string(&mut manifest_content)
+            .expect("应能读取 release manifest");
+        drop(manifest_file);
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&manifest_content).expect("manifest 应为合法 JSON");
+        assert_eq!(manifest["traceId"], "release-test");
+        assert_eq!(manifest["packageKind"], "development-release-bundle");
+        assert!(archive.by_name("dist/index.html").is_ok());
+        assert!(archive
+            .by_name("src-tauri/resources/models/README.md")
+            .is_ok());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    fn temp_workspace(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("系统时间应可用")
+            .as_nanos();
+        std::env::temp_dir().join(format!("hex-assistant-{label}-{suffix}"))
+    }
 }
