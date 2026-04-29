@@ -117,7 +117,9 @@ type ActivePlayerSnapshot = {
 type StateMachineResult = {
   state: {
     status: string;
+    player?: ActivePlayerSnapshot | null;
     pendingTier?: number | null;
+    pendingTiers?: number[];
     completedTiers: number[];
     visibleChoices: Record<string, string>;
     pauseReason?: string | null;
@@ -132,6 +134,41 @@ type StateMachineResult = {
     nextValue?: string | null;
     reason?: string | null;
   }>;
+};
+
+type RuntimeLoopSnapshot = {
+  listening: boolean;
+  state: {
+    status: string;
+    player?: ActivePlayerSnapshot | null;
+    pendingTier?: number | null;
+    pendingTiers: number[];
+    completedTiers: number[];
+    panelState: string;
+    visibleChoices: Record<string, string>;
+    pauseReason?: string | null;
+  };
+  panelSnapshot: {
+    panelState: "expanded" | "collapsed";
+    choices: Array<{ slot: number; augmentId: string }>;
+    selectedSlot?: number | null;
+  };
+  recentEvents: Array<{
+    traceId: string;
+    occurredAt: string;
+    triggerEvent: string;
+    championName?: string | null;
+    level?: number | null;
+    pendingTiers: number[];
+    slotChanges: Array<{
+      slot: number;
+      previousValue?: string | null;
+      nextValue?: string | null;
+    }>;
+    errorCode?: string | null;
+    message: string;
+  }>;
+  lastErrorCode?: string | null;
 };
 
 type ApexCacheReport = {
@@ -200,6 +237,20 @@ const replaySlotLabel: Record<"left" | "center" | "right", string> = {
   right: "右侧",
 };
 
+const assistantStatusText: Record<string, string> = {
+  waitingForGame: "等待对局",
+  waitingForTier: "等待档位",
+  pendingSelection: "待处理",
+  paused: "异常暂停",
+};
+
+const runtimeTriggerText: Record<string, string> = {
+  manual: "手动触发",
+  lowFrequencyPoll: "低频监听",
+  listenerStarted: "启动监听",
+  listenerStopped: "停止监听",
+};
+
 function App() {
   const [overview, setOverview] = useState<RuntimeOverview | null>(null);
   const [health, setHealth] = useState<HealthCheckReport | null>(null);
@@ -210,6 +261,7 @@ function App() {
   const [ocrReplay, setOcrReplay] = useState<OfflineReplayReport | null>(null);
   const [liveClient, setLiveClient] = useState<ActivePlayerSnapshot | null>(null);
   const [stateResult, setStateResult] = useState<StateMachineResult | null>(null);
+  const [runtimeLoop, setRuntimeLoop] = useState<RuntimeLoopSnapshot | null>(null);
   const [apexReport, setApexReport] = useState<ApexCacheReport | null>(null);
   const [overlayReport, setOverlayReport] = useState<OverlayOperationReport | null>(null);
   const [ocrTexts, setOcrTexts] = useState({
@@ -223,12 +275,31 @@ function App() {
     panelExpanded: true,
     selectedSlot: "",
   });
+  const [runtimePanel, setRuntimePanel] = useState({
+    panelExpanded: false,
+    slot1: "",
+    slot2: "",
+    slot3: "",
+    selectedSlot: "",
+  });
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     void loadOverview();
+    void loadRuntimeStatus();
   }, []);
+
+  useEffect(() => {
+    if (!runtimeLoop?.listening) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void loadRuntimeStatus(true);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [runtimeLoop?.listening]);
 
   const directoryReadyCount = useMemo(
     () => overview?.directories.filter((item) => item.exists).length ?? 0,
@@ -256,6 +327,25 @@ function App() {
     const data = await runCommand<RuntimeOverview>("overview", "get_runtime_overview");
     if (data) {
       setOverview(data);
+    }
+  }
+
+  async function loadRuntimeStatus(silent = false) {
+    if (silent) {
+      try {
+        setRuntimeLoop(await invoke<RuntimeLoopSnapshot>("get_runtime_orchestrator_status"));
+      } catch (caught) {
+        setError(String(caught));
+      }
+      return;
+    }
+
+    const data = await runCommand<RuntimeLoopSnapshot>(
+      "runtime-status",
+      "get_runtime_orchestrator_status",
+    );
+    if (data) {
+      setRuntimeLoop(data);
     }
   }
 
@@ -342,6 +432,61 @@ function App() {
     });
     if (data) {
       setStateResult(data);
+    }
+  }
+
+  function buildRuntimeRequest() {
+    const choices = [
+      { slot: 1, augmentId: runtimePanel.slot1.trim() },
+      { slot: 2, augmentId: runtimePanel.slot2.trim() },
+      { slot: 3, augmentId: runtimePanel.slot3.trim() },
+    ].filter((choice) => choice.augmentId.length > 0);
+    const parsedSelectedSlot = Number.parseInt(runtimePanel.selectedSlot, 10);
+    const selectedSlot =
+      runtimePanel.selectedSlot.trim() === "" || !Number.isFinite(parsedSelectedSlot)
+        ? null
+        : parsedSelectedSlot;
+
+    return {
+      request: {
+        panelSnapshot: {
+          panelState: runtimePanel.panelExpanded ? "expanded" : "collapsed",
+          choices,
+          selectedSlot,
+        },
+      },
+    };
+  }
+
+  async function triggerRuntimeLoop() {
+    const data = await runCommand<RuntimeLoopSnapshot>(
+      "runtime-trigger",
+      "trigger_runtime_orchestrator",
+      buildRuntimeRequest(),
+    );
+    if (data) {
+      setRuntimeLoop(data);
+    }
+  }
+
+  async function startRuntimeListener() {
+    const data = await runCommand<RuntimeLoopSnapshot>(
+      "runtime-start",
+      "start_runtime_listener",
+      buildRuntimeRequest(),
+    );
+    if (data) {
+      setRuntimeLoop(data);
+    }
+  }
+
+  async function stopRuntimeListener() {
+    const data = await runCommand<RuntimeLoopSnapshot>(
+      "runtime-stop",
+      "stop_runtime_listener",
+    );
+    if (data) {
+      setRuntimeLoop(data);
     }
   }
 
@@ -594,6 +739,130 @@ function App() {
             </dl>
           ) : (
             <p className="empty-state">暂无 Live Client 数据。</p>
+          )}
+        </article>
+
+        <article className="panel runtime-panel">
+          <div className="panel-heading">
+            <h2>局内闭环编排</h2>
+            <div className="inline-actions">
+              <button type="button" onClick={triggerRuntimeLoop} disabled={busy !== null}>
+                手动触发
+              </button>
+              <button
+                type="button"
+                onClick={startRuntimeListener}
+                disabled={busy !== null || runtimeLoop?.listening === true}
+              >
+                启动监听
+              </button>
+              <button
+                type="button"
+                onClick={stopRuntimeListener}
+                disabled={busy !== null || runtimeLoop?.listening !== true}
+              >
+                停止监听
+              </button>
+            </div>
+          </div>
+          <div className="form-grid">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={runtimePanel.panelExpanded}
+                onChange={(event) =>
+                  setRuntimePanel({ ...runtimePanel, panelExpanded: event.target.checked })
+                }
+              />
+              面板展开
+            </label>
+            <label>
+              左侧 slot
+              <input
+                value={runtimePanel.slot1}
+                onChange={(event) => setRuntimePanel({ ...runtimePanel, slot1: event.target.value })}
+              />
+            </label>
+            <label>
+              中间 slot
+              <input
+                value={runtimePanel.slot2}
+                onChange={(event) => setRuntimePanel({ ...runtimePanel, slot2: event.target.value })}
+              />
+            </label>
+            <label>
+              右侧 slot
+              <input
+                value={runtimePanel.slot3}
+                onChange={(event) => setRuntimePanel({ ...runtimePanel, slot3: event.target.value })}
+              />
+            </label>
+            <label>
+              已选 slot
+              <input
+                inputMode="numeric"
+                value={runtimePanel.selectedSlot}
+                onChange={(event) =>
+                  setRuntimePanel({ ...runtimePanel, selectedSlot: event.target.value })
+                }
+              />
+            </label>
+          </div>
+          {runtimeLoop ? (
+            <>
+              <dl className="metric-list compact">
+                <div>
+                  <dt>监听状态</dt>
+                  <dd>{runtimeLoop.listening ? "运行中" : "已停止"}</dd>
+                </div>
+                <div>
+                  <dt>状态机</dt>
+                  <dd>{assistantStatusText[runtimeLoop.state.status] ?? runtimeLoop.state.status}</dd>
+                </div>
+                <div>
+                  <dt>英雄/等级</dt>
+                  <dd>
+                    {runtimeLoop.state.player
+                      ? `${runtimeLoop.state.player.championName} / ${runtimeLoop.state.player.level}`
+                      : "无 Live Client 数据"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>待处理档位</dt>
+                  <dd>
+                    {runtimeLoop.state.pendingTiers.length > 0
+                      ? runtimeLoop.state.pendingTiers.join(" / ")
+                      : "无"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>面板状态</dt>
+                  <dd>{runtimeLoop.state.panelState === "expanded" ? "展开" : "收起"}</dd>
+                </div>
+                <div>
+                  <dt>错误码</dt>
+                  <dd>{runtimeLoop.lastErrorCode ?? runtimeLoop.state.pauseReason ?? "无"}</dd>
+                </div>
+              </dl>
+              <div className="event-list">
+                {runtimeLoop.recentEvents.slice(0, 5).map((event) => (
+                  <article key={event.traceId} className="event-row">
+                    <strong>{runtimeTriggerText[event.triggerEvent] ?? event.triggerEvent}</strong>
+                    <span>{event.errorCode ?? "OK"}</span>
+                    <p>
+                      {event.championName ?? "未知英雄"} · {event.level ?? "无等级"} · 待处理{" "}
+                      {event.pendingTiers.length > 0 ? event.pendingTiers.join("/") : "无"} · slot{" "}
+                      {event.slotChanges.length}
+                    </p>
+                    <small>
+                      trace id：{event.traceId} · {event.occurredAt}
+                    </small>
+                  </article>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="empty-state">暂无编排状态。</p>
           )}
         </article>
 

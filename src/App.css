@@ -225,6 +225,12 @@ input:focus {
   gap: 8px;
 }
 
+.event-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
 .result-row {
   display: grid;
   grid-template-columns: 52px minmax(0, 1fr);
@@ -253,6 +259,42 @@ input:focus {
 
 .result-row small {
   grid-column: 2;
+  color: #667085;
+}
+
+.event-row {
+  display: grid;
+  grid-template-columns: minmax(86px, auto) minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 10px;
+  border: 1px solid #dce3ec;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.event-row strong,
+.event-row span,
+.event-row p,
+.event-row small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.event-row span {
+  justify-self: end;
+  color: #26364a;
+  font-weight: 800;
+}
+
+.event-row p,
+.event-row small {
+  grid-column: 1 / -1;
+  margin-bottom: 0;
+  color: #536173;
+  line-height: 1.55;
+}
+
+.event-row small {
   color: #667085;
 }
 
@@ -425,8 +467,15 @@ input:focus {
   }
 
   .result-row,
-  .result-row small {
+  .result-row small,
+  .event-row,
+  .event-row p,
+  .event-row small {
     grid-template-columns: 1fr;
     grid-column: auto;
+  }
+
+  .event-row span {
+    justify-self: start;
   }
 }
