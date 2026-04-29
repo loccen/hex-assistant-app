@@ -1,0 +1,22 @@
+[tools]
+node = "22.22.2"
+rust = "1.94.1"
+
+[env]
+_.path = ["./node_modules/.bin"]
+
+[tasks.install]
+description = "安装前端依赖"
+run = "npm install"
+
+[tasks.build]
+description = "构建前端静态资源"
+run = "npm run build"
+
+[tasks.cargo-check]
+description = "检查 Tauri Rust 工程"
+run = "cargo check --manifest-path src-tauri/Cargo.toml"
+
+[tasks.dev]
+description = "启动 Tauri 开发模式"
+run = "npm run tauri dev"
