@@ -15,6 +15,8 @@ use crate::state_machine::{
 };
 use crate::telemetry::{append_event, new_trace_id, write_event};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -305,7 +307,7 @@ pub fn export_release_package(app: &AppHandle) -> Result<DiagnosticExportResult,
     Ok(result)
 }
 
-fn build_release_package(
+pub fn build_release_package(
     workspace_root: &Path,
     trace_id: &str,
 ) -> Result<DiagnosticExportResult, String> {
@@ -322,6 +324,8 @@ fn build_release_package(
     let mut zip = zip::ZipWriter::new(zip_file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut included_files = 0usize;
+    let mut written_entries = HashSet::new();
+    let mut checksums = Vec::new();
 
     for dir in [
         workspace_root.join("dist"),
@@ -329,28 +333,79 @@ fn build_release_package(
         workspace_root.join("release"),
         workspace_root.join("src-tauri").join("resources"),
     ] {
-        included_files += add_dir_to_zip(&mut zip, workspace_root, &dir, &zip_path, options)?;
+        included_files += add_dir_to_zip_with_checksums(
+            &mut zip,
+            workspace_root,
+            &dir,
+            &zip_path,
+            options,
+            &mut written_entries,
+            &mut checksums,
+        )?;
+    }
+
+    let artifacts = find_release_artifacts(workspace_root);
+    for artifact in &artifacts {
+        let entry_name = release_artifact_entry_name(workspace_root, artifact);
+        included_files += add_file_to_zip_as(
+            &mut zip,
+            artifact,
+            &entry_name,
+            options,
+            &mut written_entries,
+            &mut checksums,
+        )?;
     }
 
     let manifest = serde_json::json!({
         "traceId": trace_id,
         "generatedAt": Utc::now().to_rfc3339(),
         "packageKind": "development-release-bundle",
+        "sourceCommit": current_git_commit(workspace_root),
+        "hostOs": std::env::consts::OS,
+        "hostArch": std::env::consts::ARCH,
+        "artifacts": artifacts
+            .iter()
+            .map(|path| path.strip_prefix(workspace_root).unwrap_or(path).to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>(),
         "windowsInstaller": find_windows_bundle(workspace_root),
+        "resourceInventory": release_resource_inventory(workspace_root),
+        "includedSections": [
+            "dist",
+            "docs",
+            "release",
+            "src-tauri/resources",
+            "packages"
+        ],
         "notes": [
-            "当前环境如果没有 Windows Tauri 打包产物，此压缩包包含前端产物、资源目录和发布说明。",
-            "真实 Windows 截图、Overlay 点击穿透和 OCR 动态库加载仍需在 Windows 桌面验收。"
+            "当前 WSL 环境可生成 Linux 产物；Windows exe/msi 需要 Windows runner 或满足 Tauri 交叉编译条件。",
+            "如果没有 Windows Tauri 打包产物，此压缩包会保留资源说明、README、已知限制、诊断包导出说明和验证记录，但不能写作 Windows 发布已验收。",
+            "真实 Windows 截图、Overlay 点击穿透、OCR 模型加载和 ORT 动态库加载仍需在 Windows 桌面验收。"
         ]
     });
-    zip.start_file("release-manifest.json", options)
-        .map_err(|error| format!("无法写入 release manifest: {error}"))?;
-    zip.write_all(
-        serde_json::to_string_pretty(&manifest)
-            .map_err(|error| format!("无法序列化 release manifest: {error}"))?
-            .as_bytes(),
-    )
-    .map_err(|error| format!("无法写入 release manifest 内容: {error}"))?;
-    included_files += 1;
+    let manifest_content = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("无法序列化 release manifest: {error}"))?;
+    included_files += add_bytes_to_zip_as(
+        &mut zip,
+        b"release-manifest.json",
+        &manifest_content,
+        options,
+        &mut written_entries,
+        &mut checksums,
+    )?;
+
+    let checksum_content = checksums
+        .iter()
+        .map(|(entry, checksum)| format!("{checksum}  {entry}\n"))
+        .collect::<String>();
+    included_files += add_bytes_to_zip_as(
+        &mut zip,
+        b"checksums.txt",
+        checksum_content.as_bytes(),
+        options,
+        &mut written_entries,
+        &mut checksums,
+    )?;
 
     zip.finish()
         .map_err(|error| format!("无法完成 release 压缩包写入: {error}"))?;
@@ -476,6 +531,204 @@ fn add_dir_to_zip(
     Ok(included)
 }
 
+fn add_dir_to_zip_with_checksums(
+    zip: &mut zip::ZipWriter<File>,
+    root: &Path,
+    dir: &Path,
+    current_zip: &Path,
+    options: SimpleFileOptions,
+    written_entries: &mut HashSet<String>,
+    checksums: &mut Vec<(String, String)>,
+) -> Result<usize, String> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+
+    let mut included = 0usize;
+    for entry in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() || should_skip_release_input(path, current_zip) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("无法计算 release 相对路径 {}: {error}", path.display()))?;
+        let relative_name = relative.to_string_lossy().replace('\\', "/");
+        included += add_file_to_zip_as(
+            zip,
+            path,
+            &relative_name,
+            options,
+            written_entries,
+            checksums,
+        )?;
+    }
+
+    Ok(included)
+}
+
+fn add_file_to_zip_as(
+    zip: &mut zip::ZipWriter<File>,
+    path: &Path,
+    entry_name: &str,
+    options: SimpleFileOptions,
+    written_entries: &mut HashSet<String>,
+    checksums: &mut Vec<(String, String)>,
+) -> Result<usize, String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("无法读取 release 文件 {}: {error}", path.display()))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)
+        .map_err(|error| format!("无法读取 release 文件内容 {}: {error}", path.display()))?;
+    add_bytes_to_zip_as(
+        zip,
+        entry_name.as_bytes(),
+        &buffer,
+        options,
+        written_entries,
+        checksums,
+    )
+}
+
+fn add_bytes_to_zip_as(
+    zip: &mut zip::ZipWriter<File>,
+    entry_name: &[u8],
+    content: &[u8],
+    options: SimpleFileOptions,
+    written_entries: &mut HashSet<String>,
+    checksums: &mut Vec<(String, String)>,
+) -> Result<usize, String> {
+    let entry_name = String::from_utf8_lossy(entry_name).replace('\\', "/");
+    if !written_entries.insert(entry_name.clone()) {
+        return Ok(0);
+    }
+
+    zip.start_file(&entry_name, options)
+        .map_err(|error| format!("无法添加 release 文件 {entry_name}: {error}"))?;
+    zip.write_all(content)
+        .map_err(|error| format!("无法写入 release 文件 {entry_name}: {error}"))?;
+    checksums.push((entry_name, format!("{:x}", Sha256::digest(content))));
+    Ok(1)
+}
+
+fn should_skip_release_input(path: &Path, current_zip: &Path) -> bool {
+    if path == current_zip {
+        return true;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    file_name.starts_with("hex-assistant-release-")
+        && path.extension().and_then(|value| value.to_str()) == Some("zip")
+}
+
+fn find_release_artifacts(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut artifacts = Vec::new();
+    let target_release = workspace_root
+        .join("src-tauri")
+        .join("target")
+        .join("release");
+    for candidate in [
+        target_release.join("hex-assistant-app"),
+        target_release.join("hex-assistant-app.exe"),
+        target_release.join("LOL 海克斯助手.exe"),
+    ] {
+        if candidate.is_file() {
+            artifacts.push(candidate);
+        }
+    }
+
+    let bundle_dir = target_release.join("bundle");
+    if bundle_dir.exists() {
+        for entry in WalkDir::new(bundle_dir).into_iter().filter_map(Result::ok) {
+            let path = entry.into_path();
+            if path.is_file() && is_release_artifact(&path) {
+                artifacts.push(path);
+            }
+        }
+    }
+
+    artifacts.sort();
+    artifacts.dedup();
+    artifacts
+}
+
+fn is_release_artifact(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("exe" | "msi" | "msix" | "appx" | "deb" | "rpm" | "appimage" | "dmg" | "zip")
+    )
+}
+
+fn release_artifact_entry_name(workspace_root: &Path, artifact: &Path) -> String {
+    let bundle_dir = workspace_root
+        .join("src-tauri")
+        .join("target")
+        .join("release")
+        .join("bundle");
+    if let Ok(relative) = artifact.strip_prefix(&bundle_dir) {
+        return format!(
+            "packages/bundle/{}",
+            relative.to_string_lossy().replace('\\', "/")
+        );
+    }
+
+    let file_name = artifact
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    format!("packages/{file_name}")
+}
+
+fn release_resource_inventory(workspace_root: &Path) -> serde_json::Value {
+    let resources = workspace_root.join("src-tauri").join("resources");
+    serde_json::json!({
+        "dictionaries": list_relative_files(&resources, &resources.join("dictionaries")),
+        "models": list_relative_files(&resources, &resources.join("models")),
+        "onnxruntime": list_relative_files(&resources, &resources.join("onnxruntime")),
+        "requiredRuntimeNotes": [
+            "PP-OCRv4 rec ONNX 模型需随包放入 resources/models。",
+            "Windows ORT 动态库需随包放入 resources/onnxruntime，至少包含 onnxruntime.dll。",
+            "当前 README 文件是资源占位和获取说明，不等同于真实模型或动态库。"
+        ]
+    })
+}
+
+fn list_relative_files(root: &Path, dir: &Path) -> Vec<String> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        })
+        .collect()
+}
+
+fn current_git_commit(workspace_root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn timestamp_for_filename() -> String {
     Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
@@ -565,6 +818,7 @@ mod tests {
         assert!(archive
             .by_name("src-tauri/resources/models/README.md")
             .is_ok());
+        assert!(archive.by_name("checksums.txt").is_ok());
 
         let _ = fs::remove_dir_all(workspace);
     }

@@ -10,6 +10,8 @@
 - `02-architecture-and-tech-selection.md`：架构设计、模块划分、数据流和技术选型。
 - `03-acceptance-and-risks.md`：阶段验收、日志样本要求、风险和禁止事项。
 - `04-implementation-notes.md`：从 POC 迁移到本项目时的实施注意事项。
+- `05-release-and-diagnostics.md`：发布、运行、诊断包导出和验收记录规则。
+- `release/验证记录.md`：release 线实际命令验证结果，不替代 Windows 局内验收。
 
 ## 旧 POC 中已经验证的关键结论
 
