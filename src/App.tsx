@@ -33,6 +33,7 @@ type RuntimeOverview = {
     apexLol: {
       cacheTtlHours: number;
       requestTimeoutMs: number;
+      failedCacheTtlMinutes: number;
     };
   };
   directories: DirectoryStatus[];
@@ -53,6 +54,8 @@ type HealthCheckReport = {
   generatedAt: string;
   items: HealthCheckItem[];
 };
+
+type ApexParseStatus = "ok" | "noData" | "requestFailed" | "parseFailed";
 
 type DiagnosticExportResult = {
   traceId: string;
@@ -236,6 +239,7 @@ type RuntimeLoopSnapshot = {
 
 type ApexCacheReport = {
   cachePath: string;
+  reportPath?: string | null;
   generatedAt: string;
   totalEntries: number;
   okEntries: number;
@@ -245,10 +249,42 @@ type ApexCacheReport = {
     cacheKey: string;
     championName: string;
     augmentName: string;
-    status: string;
+    rating?: string | null;
+    summary: string;
+    tip?: string | null;
+    source: string;
+    sourceUrl: string;
+    requestUrl: string;
+    fetchedAt: string;
+    expiresAt: string;
+    status: ApexParseStatus;
     expired: boolean;
+    durationMs: number;
     error?: string | null;
   }>;
+};
+
+type ApexLookupResult = {
+  cacheKey: string;
+  championName: string;
+  augmentName: string;
+  rating?: string | null;
+  summary: string;
+  tip?: string | null;
+  source: string;
+  sourceUrl: string;
+  fetchedAt: string;
+  expiresAt: string;
+  cacheHit: boolean;
+  status: ApexParseStatus;
+  error?: string | null;
+  requestLog: {
+    requestUrl: string;
+    durationMs: number;
+    cacheHit: boolean;
+    parseStatus: ApexParseStatus;
+    failureReason?: string | null;
+  };
 };
 
 type OverlayOperationReport = {
@@ -424,6 +460,20 @@ function formatPoint(point: NormalizedPoint): string {
   return `${point.x.toFixed(4)},${point.y.toFixed(4)}`;
 }
 
+const apexStatusText: Record<ApexParseStatus, string> = {
+  ok: "成功",
+  noData: "暂无数据",
+  requestFailed: "请求失败",
+  parseFailed: "解析失败",
+};
+
+const apexStatusClass: Record<ApexParseStatus, string> = {
+  ok: "pass",
+  noData: "idle",
+  requestFailed: "fail",
+  parseFailed: "warn",
+};
+
 function App() {
   const [overview, setOverview] = useState<RuntimeOverview | null>(null);
   const [health, setHealth] = useState<HealthCheckReport | null>(null);
@@ -439,6 +489,7 @@ function App() {
   const [liveClient, setLiveClient] = useState<ActivePlayerSnapshot | null>(null);
   const [stateResult, setStateResult] = useState<StateMachineResult | null>(null);
   const [runtimeLoop, setRuntimeLoop] = useState<RuntimeLoopSnapshot | null>(null);
+  const [apexResult, setApexResult] = useState<ApexLookupResult | null>(null);
   const [apexReport, setApexReport] = useState<ApexCacheReport | null>(null);
   const [overlayReport, setOverlayReport] = useState<OverlayOperationReport | null>(null);
   const [ocrTexts, setOcrTexts] = useState({
@@ -458,6 +509,10 @@ function App() {
     slot2: "",
     slot3: "",
     selectedSlot: "",
+  });
+  const [apexQuery, setApexQuery] = useState({
+    championName: "放逐之刃",
+    augmentName: "灵魂虹吸",
   });
   const [error, setError] = useState<ErrorState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -765,6 +820,20 @@ function App() {
     }
   }
 
+  async function lookupApex(forceRefresh: boolean) {
+    const data = await runCommand<ApexLookupResult>("apex-lookup", "lookup_apex_lol", {
+      request: {
+        championName: apexQuery.championName.trim(),
+        augmentName: apexQuery.augmentName.trim(),
+        forceRefresh,
+      },
+    });
+    if (data) {
+      setApexResult(data);
+      await loadApexCacheReport();
+    }
+  }
+
   async function showOverlayCard() {
     const data = await runCommand<OverlayOperationReport>("overlay-show", "show_overlay_test_card", {
       request: {
@@ -853,6 +922,14 @@ function App() {
             <div>
               <dt>ApexLOL 超时</dt>
               <dd>{overview ? `${overview.settings.apexLol.requestTimeoutMs} ms` : "待加载"}</dd>
+            </div>
+            <div>
+              <dt>ApexLOL TTL</dt>
+              <dd>
+                {overview
+                  ? `${overview.settings.apexLol.cacheTtlHours} 小时 / 失败 ${overview.settings.apexLol.failedCacheTtlMinutes} 分钟`
+                  : "待加载"}
+              </dd>
             </div>
           </dl>
         </article>
@@ -1387,7 +1464,116 @@ function App() {
 
         <article className="panel">
           <div className="panel-heading">
-            <h2>Apex 缓存</h2>
+            <h2>ApexLOL 查询</h2>
+            <div className="inline-actions">
+              <button
+                type="button"
+                onClick={() => void lookupApex(false)}
+                disabled={busy !== null || !apexQuery.championName.trim() || !apexQuery.augmentName.trim()}
+              >
+                查询
+              </button>
+              <button
+                type="button"
+                onClick={() => void lookupApex(true)}
+                disabled={busy !== null || !apexQuery.championName.trim() || !apexQuery.augmentName.trim()}
+              >
+                刷新
+              </button>
+            </div>
+          </div>
+          <div className="form-grid two-columns">
+            <label>
+              英雄
+              <input
+                value={apexQuery.championName}
+                onChange={(event) =>
+                  setApexQuery({ ...apexQuery, championName: event.target.value })
+                }
+              />
+            </label>
+            <label>
+              海克斯
+              <input
+                value={apexQuery.augmentName}
+                onChange={(event) =>
+                  setApexQuery({ ...apexQuery, augmentName: event.target.value })
+                }
+              />
+            </label>
+          </div>
+          {apexResult ? (
+            <div className="apex-result">
+              <div className="apex-result-title">
+                <span className={`badge ${apexStatusClass[apexResult.status]}`}>
+                  {apexStatusText[apexResult.status]}
+                </span>
+                <strong>
+                  {apexResult.championName} · {apexResult.augmentName}
+                </strong>
+              </div>
+              {apexResult.status === "ok" ? (
+                <dl className="metric-list">
+                  <div>
+                    <dt>评级</dt>
+                    <dd className="apex-rating">{apexResult.rating ?? "暂无数据"}</dd>
+                  </div>
+                  <div>
+                    <dt>摘要</dt>
+                    <dd>{apexResult.summary}</dd>
+                  </div>
+                  <div>
+                    <dt>提醒</dt>
+                    <dd>{apexResult.tip ?? "暂无数据"}</dd>
+                  </div>
+                </dl>
+              ) : (
+                <dl className="metric-list">
+                  <div>
+                    <dt>结果</dt>
+                    <dd>暂无数据</dd>
+                  </div>
+                  <div>
+                    <dt>失败原因</dt>
+                    <dd>{apexResult.error ?? apexResult.requestLog.failureReason ?? "未返回原因"}</dd>
+                  </div>
+                </dl>
+              )}
+              <dl className="metric-list compact apex-meta">
+                <div>
+                  <dt>缓存</dt>
+                  <dd>{apexResult.cacheHit ? "命中" : "未命中"}</dd>
+                </div>
+                <div>
+                  <dt>耗时</dt>
+                  <dd>{apexResult.requestLog.durationMs} ms</dd>
+                </div>
+                <div>
+                  <dt>获取时间</dt>
+                  <dd>{apexResult.fetchedAt}</dd>
+                </div>
+                <div>
+                  <dt>过期时间</dt>
+                  <dd>{apexResult.expiresAt}</dd>
+                </div>
+                <div>
+                  <dt>来源 URL</dt>
+                  <dd>{apexResult.sourceUrl}</dd>
+                </div>
+                <div>
+                  <dt>缓存键</dt>
+                  <dd>{apexResult.cacheKey}</dd>
+                </div>
+              </dl>
+            </div>
+          ) : (
+            <p className="empty-state">输入英雄和海克斯后可查询；刷新会绕过本地缓存。</p>
+          )}
+        </article>
+
+        <article className="panel">
+          <div className="panel-heading">
+            <h2>ApexLOL 缓存报告</h2>
             <button type="button" onClick={loadApexCacheReport} disabled={busy !== null}>
               生成报告
             </button>
@@ -1406,10 +1592,38 @@ function App() {
                   </dd>
                 </div>
               </dl>
-              <p className="trace-line">{apexReport.cachePath}</p>
+              <p className="trace-line">
+                缓存：{apexReport.cachePath}
+                {apexReport.reportPath ? `；报告：${apexReport.reportPath}` : ""}
+              </p>
+              {apexReport.entries.length > 0 ? (
+                <div className="cache-entry-list">
+                  {apexReport.entries.slice(0, 6).map((entry) => (
+                    <article key={entry.cacheKey} className="cache-entry">
+                      <div>
+                        <strong>
+                          {entry.championName} · {entry.augmentName}
+                        </strong>
+                        <span className={`badge ${apexStatusClass[entry.status]}`}>
+                          {apexStatusText[entry.status]}
+                        </span>
+                      </div>
+                      <p>
+                        {entry.rating ? `评级 ${entry.rating} · ` : ""}
+                        {entry.summary}
+                      </p>
+                      <small>
+                        {entry.expired ? "已过期" : "有效"} · {entry.durationMs} ms ·{" "}
+                        {entry.fetchedAt} · {entry.sourceUrl}
+                        {entry.error ? ` · ${entry.error}` : ""}
+                      </small>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
             </>
           ) : (
-            <p className="empty-state">暂无 Apex 缓存报告。</p>
+            <p className="empty-state">暂无 ApexLOL 缓存报告。</p>
           )}
         </article>
 
