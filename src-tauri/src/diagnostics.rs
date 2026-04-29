@@ -332,6 +332,14 @@ pub fn build_release_package(
                 .to_string(),
         );
     }
+    for artifact in artifacts.iter().filter(|path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false)
+    }) {
+        reject_dev_server_windows_exe(artifact)?;
+    }
 
     let resource_entries = release_resource_entries(workspace_root);
     let missing_resources = resource_entries
@@ -416,8 +424,8 @@ pub fn build_release_package(
         "target": "x86_64-pc-windows-gnu",
         "windowsOnly": true,
         "buildCommands": [
-            "mise exec -- npm run build",
-            "mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu"
+            "mise exec -- npm run build:windows",
+            "mise exec -- npm run release:zip"
         ],
         "artifacts": artifact_entries,
         "windowsPackageStatus": {
@@ -684,6 +692,21 @@ fn release_resource_entries(workspace_root: &Path) -> Vec<(PathBuf, String)> {
     ]
 }
 
+fn reject_dev_server_windows_exe(path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("无法读取 Windows exe {}: {error}", path.display()))?;
+    if !bytes
+        .windows(b"/index.html".len())
+        .any(|window| window == b"/index.html")
+    {
+        return Err(format!(
+            "Windows exe {} 未发现嵌入的前端入口 /index.html，拒绝生成 release 包。请执行 Tauri build。",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn find_windows_release_artifacts(workspace_root: &Path) -> Vec<PathBuf> {
     let mut artifacts = Vec::new();
     let target_release = workspace_root
@@ -834,7 +857,7 @@ mod tests {
                 .join("x86_64-pc-windows-gnu")
                 .join("release")
                 .join("hex-assistant-app.exe"),
-            b"exe",
+            b"pe-stub /index.html",
         )
         .expect("应能写入 Windows exe");
         fs::write(

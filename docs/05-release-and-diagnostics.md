@@ -24,7 +24,7 @@ mise exec -- npm run check:rust
 
 ```bash
 mise exec -- npm run build
-mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu
+mise exec -- npm run build:windows
 mise exec -- npm run release:zip
 ```
 
@@ -46,7 +46,7 @@ mise exec -- npm run build:windows
 
 ```bash
 mise exec -- npm run build
-mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu
+mise exec -- npm run build:windows
 ```
 
 本项目最终交付只发布 Windows 用户包。不要把 Linux 产物、前端源码、`dist/` 或长文档目录打进用户 zip。
