@@ -17,6 +17,35 @@ pub struct CalibrationConfig {
     pub coordinate_space: CoordinateSpace,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PixelCalibrationInput {
+    pub screenshot_size: ScreenshotSize,
+    pub name_regions: [PixelRect; 3],
+    pub bottom_anchors: [PixelPoint; 3],
+    pub bottom_button_region: PixelRect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationProfileResult {
+    pub path: PathBuf,
+    pub config: CalibrationConfig,
+    pub echo: CalibrationEcho,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationEcho {
+    pub screenshot_size: ScreenshotSize,
+    pub name_region_pixels: [PixelRect; 3],
+    pub bottom_anchor_pixels: [PixelPoint; 3],
+    pub bottom_button_region_pixels: PixelRect,
+    pub name_regions: [NormalizedRect; 3],
+    pub bottom_anchors: [NormalizedPoint; 3],
+    pub bottom_button_region: NormalizedRect,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreenshotSize {
@@ -106,6 +135,19 @@ pub fn save_calibration_config(
     Ok(path)
 }
 
+pub fn save_pixel_calibration_config(
+    app_data_dir: impl AsRef<Path>,
+    input: PixelCalibrationInput,
+) -> Result<CalibrationProfileResult, String> {
+    let config = build_calibration_config_from_pixels(input)?;
+    let path = save_calibration_config(app_data_dir, &config)?;
+    Ok(CalibrationProfileResult {
+        path,
+        echo: build_calibration_echo(&config)?,
+        config,
+    })
+}
+
 pub fn load_calibration_config(
     app_data_dir: impl AsRef<Path>,
 ) -> Result<CalibrationConfig, String> {
@@ -116,6 +158,69 @@ pub fn load_calibration_config(
         .map_err(|error| format!("无法解析校准配置 {}: {error}", path.display()))?;
     config.validate()?;
     Ok(config)
+}
+
+pub fn load_calibration_profile<P: AsRef<Path>>(
+    app_data_dir: P,
+) -> Result<CalibrationProfileResult, String> {
+    let path = calibration_config_path(app_data_dir.as_ref());
+    let config = load_calibration_config(app_data_dir)?;
+    Ok(CalibrationProfileResult {
+        path,
+        echo: build_calibration_echo(&config)?,
+        config,
+    })
+}
+
+pub fn build_calibration_config_from_pixels(
+    input: PixelCalibrationInput,
+) -> Result<CalibrationConfig, String> {
+    let name_regions = [
+        normalize_pixel_rect(input.name_regions[0], input.screenshot_size, "名称区域 1")?,
+        normalize_pixel_rect(input.name_regions[1], input.screenshot_size, "名称区域 2")?,
+        normalize_pixel_rect(input.name_regions[2], input.screenshot_size, "名称区域 3")?,
+    ];
+    let bottom_anchors = [
+        normalize_pixel_point(input.bottom_anchors[0], input.screenshot_size, "底部锚点 1")?,
+        normalize_pixel_point(input.bottom_anchors[1], input.screenshot_size, "底部锚点 2")?,
+        normalize_pixel_point(input.bottom_anchors[2], input.screenshot_size, "底部锚点 3")?,
+    ];
+    let bottom_button_region = normalize_pixel_rect(
+        input.bottom_button_region,
+        input.screenshot_size,
+        "底部按钮区域",
+    )?;
+
+    Ok(CalibrationConfig::new(
+        input.screenshot_size,
+        name_regions,
+        bottom_anchors,
+        bottom_button_region,
+    ))
+}
+
+pub fn build_calibration_echo(config: &CalibrationConfig) -> Result<CalibrationEcho, String> {
+    config.validate()?;
+    Ok(CalibrationEcho {
+        screenshot_size: config.screenshot_size,
+        name_region_pixels: [
+            denormalize_rect(config.name_regions[0], config.screenshot_size)?,
+            denormalize_rect(config.name_regions[1], config.screenshot_size)?,
+            denormalize_rect(config.name_regions[2], config.screenshot_size)?,
+        ],
+        bottom_anchor_pixels: [
+            denormalize_point(config.bottom_anchors[0], config.screenshot_size)?,
+            denormalize_point(config.bottom_anchors[1], config.screenshot_size)?,
+            denormalize_point(config.bottom_anchors[2], config.screenshot_size)?,
+        ],
+        bottom_button_region_pixels: denormalize_rect(
+            config.bottom_button_region,
+            config.screenshot_size,
+        )?,
+        name_regions: config.name_regions,
+        bottom_anchors: config.bottom_anchors,
+        bottom_button_region: config.bottom_button_region,
+    })
 }
 
 pub fn normalize_rect(
@@ -145,6 +250,15 @@ pub fn normalize_rect(
     })
 }
 
+pub fn normalize_pixel_rect(
+    rect: PixelRect,
+    screenshot_size: ScreenshotSize,
+    label: &str,
+) -> Result<NormalizedRect, String> {
+    normalize_rect(rect.x, rect.y, rect.width, rect.height, screenshot_size)
+        .map_err(|error| format!("{label}: {error}"))
+}
+
 pub fn normalize_point(
     x: u32,
     y: u32,
@@ -161,6 +275,14 @@ pub fn normalize_point(
         x: f64::from(x) / f64::from(screenshot_size.width),
         y: f64::from(y) / f64::from(screenshot_size.height),
     })
+}
+
+pub fn normalize_pixel_point(
+    point: PixelPoint,
+    screenshot_size: ScreenshotSize,
+    label: &str,
+) -> Result<NormalizedPoint, String> {
+    normalize_point(point.x, point.y, screenshot_size).map_err(|error| format!("{label}: {error}"))
 }
 
 pub fn denormalize_rect(
@@ -180,12 +302,35 @@ pub fn denormalize_rect(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub fn denormalize_point(
+    point: NormalizedPoint,
+    screenshot_size: ScreenshotSize,
+) -> Result<PixelPoint, String> {
+    validate_point(point, "归一化点位")?;
+    if screenshot_size.width == 0 || screenshot_size.height == 0 {
+        return Err("截图尺寸不能为 0".to_string());
+    }
+
+    Ok(PixelPoint {
+        x: (point.x * f64::from(screenshot_size.width)).round() as u32,
+        y: (point.y * f64::from(screenshot_size.height)).round() as u32,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PixelRect {
     pub x: u32,
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PixelPoint {
+    pub x: u32,
+    pub y: u32,
 }
 
 fn validate_rect(rect: NormalizedRect, label: &str) -> Result<(), String> {
@@ -281,6 +426,108 @@ mod tests {
 
         assert!(path.ends_with("calibration/screen-calibration.json"));
         assert_eq!(loaded, config);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_and_echoes_pixel_calibration_profile() {
+        let input = PixelCalibrationInput {
+            screenshot_size: ScreenshotSize {
+                width: 1920,
+                height: 1080,
+            },
+            name_regions: [
+                PixelRect {
+                    x: 192,
+                    y: 108,
+                    width: 192,
+                    height: 54,
+                },
+                PixelRect {
+                    x: 864,
+                    y: 108,
+                    width: 192,
+                    height: 54,
+                },
+                PixelRect {
+                    x: 1536,
+                    y: 108,
+                    width: 192,
+                    height: 54,
+                },
+            ],
+            bottom_anchors: [
+                PixelPoint { x: 384, y: 972 },
+                PixelPoint { x: 960, y: 972 },
+                PixelPoint { x: 1536, y: 972 },
+            ],
+            bottom_button_region: PixelRect {
+                x: 768,
+                y: 886,
+                width: 384,
+                height: 86,
+            },
+        };
+
+        let config =
+            build_calibration_config_from_pixels(input).expect("像素校准输入应能转换为配置");
+        let echo = build_calibration_echo(&config).expect("应能生成回显数据");
+
+        assert_eq!(config.screenshot_size.width, 1920);
+        assert_eq!(config.name_regions[0].x, 0.1);
+        assert_eq!(echo.name_region_pixels[1].x, 864);
+        assert_eq!(echo.bottom_anchor_pixels[2].y, 972);
+        assert_eq!(echo.bottom_button_region_pixels.width, 384);
+    }
+
+    #[test]
+    fn saves_pixel_calibration_profile_with_path_and_echo() {
+        let root = temp_root("pixel-calibration");
+        let input = PixelCalibrationInput {
+            screenshot_size: ScreenshotSize {
+                width: 1000,
+                height: 500,
+            },
+            name_regions: [
+                PixelRect {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 30,
+                },
+                PixelRect {
+                    x: 450,
+                    y: 20,
+                    width: 100,
+                    height: 30,
+                },
+                PixelRect {
+                    x: 800,
+                    y: 20,
+                    width: 100,
+                    height: 30,
+                },
+            ],
+            bottom_anchors: [
+                PixelPoint { x: 100, y: 450 },
+                PixelPoint { x: 500, y: 450 },
+                PixelPoint { x: 900, y: 450 },
+            ],
+            bottom_button_region: PixelRect {
+                x: 400,
+                y: 420,
+                width: 200,
+                height: 50,
+            },
+        };
+
+        let saved = save_pixel_calibration_config(&root, input).expect("应能保存像素校准配置");
+        let loaded = load_calibration_profile(&root).expect("应能加载校准配置和回显");
+
+        assert!(saved.path.ends_with("calibration/screen-calibration.json"));
+        assert_eq!(saved.config, loaded.config);
+        assert_eq!(loaded.echo.bottom_button_region_pixels.height, 50);
 
         let _ = fs::remove_dir_all(root);
     }

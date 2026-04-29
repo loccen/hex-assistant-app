@@ -75,6 +75,14 @@ pub fn capture_primary_monitor_sample(
     capture_monitor_sample(app_data_dir, None)
 }
 
+pub fn list_monitor_diagnostics() -> Result<Vec<MonitorDiagnostic>, String> {
+    Monitor::all()
+        .map_err(|error| format!("无法枚举显示器: {error}"))?
+        .iter()
+        .map(read_monitor_diagnostic)
+        .collect()
+}
+
 pub fn capture_monitor_sample(
     app_data_dir: impl AsRef<Path>,
     preferred_monitor_id: Option<u32>,
@@ -383,5 +391,12 @@ mod tests {
         let path = capture_samples_dir("/tmp/hex-app");
 
         assert!(path.ends_with("captures/samples"));
+    }
+
+    #[test]
+    fn classifies_black_screen_by_luma_and_bright_ratio() {
+        assert!(is_black_screen(2.9, 0.0005));
+        assert!(!is_black_screen(4.0, 0.0005));
+        assert!(!is_black_screen(2.9, 0.01));
     }
 }

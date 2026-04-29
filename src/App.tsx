@@ -60,20 +60,33 @@ type DiagnosticExportResult = {
   includedFiles: number;
 };
 
+type MonitorDiagnostic = {
+  id: number;
+  name: string;
+  friendlyName: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number;
+  scaleFactor: number;
+  frequency: number;
+  primary: boolean;
+  builtin: boolean;
+};
+
 type CaptureSampleReport = {
   capturedAt: string;
-  monitor: {
-    id: number;
-    name: string;
-    friendlyName: string;
-    width: number;
-    height: number;
-    primary: boolean;
-  };
+  monitor: MonitorDiagnostic;
   image: {
     width: number;
     height: number;
+    captureDurationMs: number;
+    saveDurationMs: number;
     meanLuma: number;
+    minLuma: number;
+    maxLuma: number;
+    brightPixelRatio: number;
     blackScreen: boolean;
     frameHash: string;
   };
@@ -81,6 +94,56 @@ type CaptureSampleReport = {
   jsonPath: string;
   previousFrameHash?: string | null;
   staleFrame: boolean;
+};
+
+type ScreenshotSize = {
+  width: number;
+  height: number;
+};
+
+type NormalizedRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type NormalizedPoint = {
+  x: number;
+  y: number;
+};
+
+type PixelRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type PixelPoint = {
+  x: number;
+  y: number;
+};
+
+type CalibrationProfileResult = {
+  path: string;
+  config: {
+    version: number;
+    screenshotSize: ScreenshotSize;
+    nameRegions: [NormalizedRect, NormalizedRect, NormalizedRect];
+    bottomAnchors: [NormalizedPoint, NormalizedPoint, NormalizedPoint];
+    bottomButtonRegion: NormalizedRect;
+    coordinateSpace: string;
+  };
+  echo: {
+    screenshotSize: ScreenshotSize;
+    nameRegionPixels: [PixelRect, PixelRect, PixelRect];
+    bottomAnchorPixels: [PixelPoint, PixelPoint, PixelPoint];
+    bottomButtonRegionPixels: PixelRect;
+    nameRegions: [NormalizedRect, NormalizedRect, NormalizedRect];
+    bottomAnchors: [NormalizedPoint, NormalizedPoint, NormalizedPoint];
+    bottomButtonRegion: NormalizedRect;
+  };
 };
 
 type OcrResourceStatus = {
@@ -200,12 +263,126 @@ const replaySlotLabel: Record<"left" | "center" | "right", string> = {
   right: "右侧",
 };
 
+type ErrorState = {
+  code: string;
+  message: string;
+};
+
+type RectFields = {
+  x: string;
+  y: string;
+  width: string;
+  height: string;
+};
+
+type PointFields = {
+  x: string;
+  y: string;
+};
+
+type CalibrationForm = {
+  screenshotWidth: string;
+  screenshotHeight: string;
+  nameRegions: [RectFields, RectFields, RectFields];
+  bottomAnchors: [PointFields, PointFields, PointFields];
+  bottomButtonRegion: RectFields;
+};
+
+const nameRegionLabels = ["左侧名称", "中间名称", "右侧名称"] as const;
+const anchorLabels = ["左侧锚点", "中间锚点", "右侧锚点"] as const;
+
+function createCalibrationForm(width = 1920, height = 1080): CalibrationForm {
+  return {
+    screenshotWidth: String(width),
+    screenshotHeight: String(height),
+    nameRegions: [
+      { x: "420", y: "350", width: "260", height: "64" },
+      { x: "830", y: "350", width: "260", height: "64" },
+      { x: "1240", y: "350", width: "260", height: "64" },
+    ],
+    bottomAnchors: [
+      { x: "520", y: "900" },
+      { x: "960", y: "900" },
+      { x: "1400", y: "900" },
+    ],
+    bottomButtonRegion: { x: "760", y: "880", width: "400", height: "110" },
+  };
+}
+
+function extractErrorState(caught: unknown): ErrorState {
+  const message = String(caught);
+  const match = message.match(/\bHEX-[A-Z0-9-]+/);
+  return {
+    code: match?.[0] ?? "HEX-UI-COMMAND",
+    message,
+  };
+}
+
+function parseUint(value: string, label: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`HEX-CALIBRATION-FORM: ${label} 必须是非负整数`);
+  }
+  return parsed;
+}
+
+function rectFromFields(rect: RectFields, label: string): PixelRect {
+  return {
+    x: parseUint(rect.x, `${label} X`),
+    y: parseUint(rect.y, `${label} Y`),
+    width: parseUint(rect.width, `${label} 宽度`),
+    height: parseUint(rect.height, `${label} 高度`),
+  };
+}
+
+function pointFromFields(point: PointFields, label: string): PixelPoint {
+  return {
+    x: parseUint(point.x, `${label} X`),
+    y: parseUint(point.y, `${label} Y`),
+  };
+}
+
+function calibrationFormFromEcho(result: CalibrationProfileResult): CalibrationForm {
+  return {
+    screenshotWidth: String(result.echo.screenshotSize.width),
+    screenshotHeight: String(result.echo.screenshotSize.height),
+    nameRegions: result.echo.nameRegionPixels.map((rect) => ({
+      x: String(rect.x),
+      y: String(rect.y),
+      width: String(rect.width),
+      height: String(rect.height),
+    })) as [RectFields, RectFields, RectFields],
+    bottomAnchors: result.echo.bottomAnchorPixels.map((point) => ({
+      x: String(point.x),
+      y: String(point.y),
+    })) as [PointFields, PointFields, PointFields],
+    bottomButtonRegion: {
+      x: String(result.echo.bottomButtonRegionPixels.x),
+      y: String(result.echo.bottomButtonRegionPixels.y),
+      width: String(result.echo.bottomButtonRegionPixels.width),
+      height: String(result.echo.bottomButtonRegionPixels.height),
+    },
+  };
+}
+
+function formatRect(rect: NormalizedRect): string {
+  return `${rect.x.toFixed(4)},${rect.y.toFixed(4)},${rect.width.toFixed(4)}x${rect.height.toFixed(4)}`;
+}
+
+function formatPoint(point: NormalizedPoint): string {
+  return `${point.x.toFixed(4)},${point.y.toFixed(4)}`;
+}
+
 function App() {
   const [overview, setOverview] = useState<RuntimeOverview | null>(null);
   const [health, setHealth] = useState<HealthCheckReport | null>(null);
   const [diagnosticExport, setDiagnosticExport] = useState<DiagnosticExportResult | null>(null);
   const [releaseExport, setReleaseExport] = useState<DiagnosticExportResult | null>(null);
+  const [monitors, setMonitors] = useState<MonitorDiagnostic[]>([]);
+  const [selectedMonitorId, setSelectedMonitorId] = useState<string>("");
   const [captureReport, setCaptureReport] = useState<CaptureSampleReport | null>(null);
+  const [calibrationForm, setCalibrationForm] = useState<CalibrationForm>(() => createCalibrationForm());
+  const [calibrationResult, setCalibrationResult] = useState<CalibrationProfileResult | null>(null);
   const [ocrStatus, setOcrStatus] = useState<OcrResourceStatus | null>(null);
   const [ocrReplay, setOcrReplay] = useState<OfflineReplayReport | null>(null);
   const [liveClient, setLiveClient] = useState<ActivePlayerSnapshot | null>(null);
@@ -223,11 +400,12 @@ function App() {
     panelExpanded: true,
     selectedSlot: "",
   });
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ErrorState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     void loadOverview();
+    void loadMonitors();
   }, []);
 
   const directoryReadyCount = useMemo(
@@ -245,7 +423,7 @@ function App() {
     try {
       return await invoke<T>(command, args);
     } catch (caught) {
-      setError(String(caught));
+      setError(extractErrorState(caught));
       return null;
     } finally {
       setBusy(null);
@@ -256,6 +434,17 @@ function App() {
     const data = await runCommand<RuntimeOverview>("overview", "get_runtime_overview");
     if (data) {
       setOverview(data);
+    }
+  }
+
+  async function loadMonitors() {
+    const data = await runCommand<MonitorDiagnostic[]>("monitors", "list_capture_monitors");
+    if (data) {
+      setMonitors(data);
+      const primary = data.find((monitor) => monitor.primary) ?? data[0];
+      if (primary && selectedMonitorId === "") {
+        setSelectedMonitorId(String(primary.id));
+      }
     }
   }
 
@@ -284,12 +473,91 @@ function App() {
   }
 
   async function captureSample() {
+    const preferredMonitorId = selectedMonitorId === "" ? null : Number.parseInt(selectedMonitorId, 10);
     const data = await runCommand<CaptureSampleReport>("capture", "capture_monitor_sample", {
-      preferredMonitorId: null,
+      preferredMonitorId,
     });
     if (data) {
       setCaptureReport(data);
+      setCalibrationForm((current) => ({
+        ...current,
+        screenshotWidth: String(data.image.width),
+        screenshotHeight: String(data.image.height),
+      }));
     }
+  }
+
+  function buildCalibrationInput() {
+    const screenshotSize = {
+      width: parseUint(calibrationForm.screenshotWidth, "原始截图宽度"),
+      height: parseUint(calibrationForm.screenshotHeight, "原始截图高度"),
+    };
+    return {
+      input: {
+        screenshotSize,
+        nameRegions: calibrationForm.nameRegions.map((rect, index) =>
+          rectFromFields(rect, nameRegionLabels[index]),
+        ),
+        bottomAnchors: calibrationForm.bottomAnchors.map((point, index) =>
+          pointFromFields(point, anchorLabels[index]),
+        ),
+        bottomButtonRegion: rectFromFields(calibrationForm.bottomButtonRegion, "底部按钮区域"),
+      },
+    };
+  }
+
+  async function saveCalibration() {
+    let args: ReturnType<typeof buildCalibrationInput>;
+    try {
+      args = buildCalibrationInput();
+    } catch (caught) {
+      setError(extractErrorState(caught));
+      return;
+    }
+    const data = await runCommand<CalibrationProfileResult>(
+      "calibration-save",
+      "save_pixel_calibration_profile",
+      args,
+    );
+    if (data) {
+      setCalibrationResult(data);
+      setCalibrationForm(calibrationFormFromEcho(data));
+      await loadOverview();
+    }
+  }
+
+  async function loadCalibration() {
+    const data = await runCommand<CalibrationProfileResult>(
+      "calibration-load",
+      "load_calibration_profile",
+    );
+    if (data) {
+      setCalibrationResult(data);
+      setCalibrationForm(calibrationFormFromEcho(data));
+    }
+  }
+
+  function updateNameRegion(index: number, field: keyof RectFields, value: string) {
+    setCalibrationForm((current) => {
+      const nameRegions = [...current.nameRegions] as [RectFields, RectFields, RectFields];
+      nameRegions[index] = { ...nameRegions[index], [field]: value };
+      return { ...current, nameRegions };
+    });
+  }
+
+  function updateBottomAnchor(index: number, field: keyof PointFields, value: string) {
+    setCalibrationForm((current) => {
+      const bottomAnchors = [...current.bottomAnchors] as [PointFields, PointFields, PointFields];
+      bottomAnchors[index] = { ...bottomAnchors[index], [field]: value };
+      return { ...current, bottomAnchors };
+    });
+  }
+
+  function updateBottomButtonRegion(field: keyof RectFields, value: string) {
+    setCalibrationForm((current) => ({
+      ...current,
+      bottomButtonRegion: { ...current.bottomButtonRegion, [field]: value },
+    }));
   }
 
   async function checkOcrResources() {
@@ -395,7 +663,11 @@ function App() {
         </div>
       </header>
 
-      {error ? <section className="error-banner">错误：{error}</section> : null}
+      {error ? (
+        <section className="error-banner">
+          错误码：{error.code}；{error.message}
+        </section>
+      ) : null}
 
       <section className="summary-grid" aria-label="运行概览">
         <article className="panel">
@@ -470,10 +742,32 @@ function App() {
         <article className="panel">
           <div className="panel-heading">
             <h2>截图诊断</h2>
-            <button type="button" onClick={captureSample} disabled={busy !== null}>
-              采集样本
-            </button>
+            <div className="inline-actions">
+              <button type="button" onClick={loadMonitors} disabled={busy !== null}>
+                刷新显示器
+              </button>
+              <button type="button" onClick={captureSample} disabled={busy !== null}>
+                采集样本
+              </button>
+            </div>
           </div>
+          <label className="field-stack">
+            目标显示器
+            <select
+              value={selectedMonitorId}
+              onChange={(event) => setSelectedMonitorId(event.target.value)}
+              disabled={busy !== null || monitors.length === 0}
+            >
+              <option value="">主显示器</option>
+              {monitors.map((monitor) => (
+                <option key={monitor.id} value={monitor.id}>
+                  {monitor.primary ? "主屏 · " : ""}
+                  {monitor.friendlyName || monitor.name || `显示器 ${monitor.id}`} · {monitor.width}x
+                  {monitor.height} @ {monitor.x},{monitor.y}
+                </option>
+              ))}
+            </select>
+          </label>
           {captureReport ? (
             <dl className="metric-list">
               <div>
@@ -487,17 +781,176 @@ function App() {
                 <dt>画面质量</dt>
                 <dd>
                   亮度 {captureReport.image.meanLuma.toFixed(2)} ·{" "}
+                  范围 {captureReport.image.minLuma}-{captureReport.image.maxLuma} ·{" "}
                   {captureReport.image.blackScreen ? "黑屏" : "可见"} ·{" "}
                   {captureReport.staleFrame ? "重复帧" : "新帧"}
                 </dd>
               </div>
               <div>
-                <dt>样本文件</dt>
+                <dt>尺寸与耗时</dt>
+                <dd>
+                  {captureReport.image.width}x{captureReport.image.height} · 截图{" "}
+                  {captureReport.image.captureDurationMs} ms · 保存{" "}
+                  {captureReport.image.saveDurationMs} ms
+                </dd>
+              </div>
+              <div>
+                <dt>样本 PNG</dt>
                 <dd>{captureReport.pngPath}</dd>
+              </div>
+              <div>
+                <dt>诊断 JSON</dt>
+                <dd>{captureReport.jsonPath}</dd>
+              </div>
+              <div>
+                <dt>帧诊断</dt>
+                <dd>
+                  高亮像素 {captureReport.image.brightPixelRatio.toFixed(6)} · hash{" "}
+                  {captureReport.image.frameHash.slice(0, 16)}
+                  {captureReport.previousFrameHash
+                    ? ` · 旧帧 ${captureReport.previousFrameHash.slice(0, 16)}`
+                    : ""}
+                </dd>
               </div>
             </dl>
           ) : (
             <p className="empty-state">暂无截图样本。</p>
+          )}
+        </article>
+
+        <article className="panel wide-panel">
+          <div className="panel-heading">
+            <h2>用户校准</h2>
+            <div className="inline-actions">
+              <button type="button" onClick={loadCalibration} disabled={busy !== null}>
+                加载配置
+              </button>
+              <button type="button" onClick={saveCalibration} disabled={busy !== null}>
+                保存配置
+              </button>
+            </div>
+          </div>
+          <div className="form-grid size-grid">
+            <label>
+              原始截图宽度
+              <input
+                inputMode="numeric"
+                value={calibrationForm.screenshotWidth}
+                onChange={(event) =>
+                  setCalibrationForm({ ...calibrationForm, screenshotWidth: event.target.value })
+                }
+              />
+            </label>
+            <label>
+              原始截图高度
+              <input
+                inputMode="numeric"
+                value={calibrationForm.screenshotHeight}
+                onChange={(event) =>
+                  setCalibrationForm({ ...calibrationForm, screenshotHeight: event.target.value })
+                }
+              />
+            </label>
+          </div>
+          <div className="calibration-grid">
+            {calibrationForm.nameRegions.map((rect, index) => (
+              <fieldset key={nameRegionLabels[index]} className="calibration-group">
+                <legend>{nameRegionLabels[index]}</legend>
+                <input
+                  aria-label={`${nameRegionLabels[index]} X`}
+                  inputMode="numeric"
+                  value={rect.x}
+                  onChange={(event) => updateNameRegion(index, "x", event.target.value)}
+                />
+                <input
+                  aria-label={`${nameRegionLabels[index]} Y`}
+                  inputMode="numeric"
+                  value={rect.y}
+                  onChange={(event) => updateNameRegion(index, "y", event.target.value)}
+                />
+                <input
+                  aria-label={`${nameRegionLabels[index]} 宽度`}
+                  inputMode="numeric"
+                  value={rect.width}
+                  onChange={(event) => updateNameRegion(index, "width", event.target.value)}
+                />
+                <input
+                  aria-label={`${nameRegionLabels[index]} 高度`}
+                  inputMode="numeric"
+                  value={rect.height}
+                  onChange={(event) => updateNameRegion(index, "height", event.target.value)}
+                />
+              </fieldset>
+            ))}
+            {calibrationForm.bottomAnchors.map((point, index) => (
+              <fieldset key={anchorLabels[index]} className="calibration-group point-group">
+                <legend>{anchorLabels[index]}</legend>
+                <input
+                  aria-label={`${anchorLabels[index]} X`}
+                  inputMode="numeric"
+                  value={point.x}
+                  onChange={(event) => updateBottomAnchor(index, "x", event.target.value)}
+                />
+                <input
+                  aria-label={`${anchorLabels[index]} Y`}
+                  inputMode="numeric"
+                  value={point.y}
+                  onChange={(event) => updateBottomAnchor(index, "y", event.target.value)}
+                />
+              </fieldset>
+            ))}
+            <fieldset className="calibration-group">
+              <legend>底部按钮区域</legend>
+              <input
+                aria-label="底部按钮区域 X"
+                inputMode="numeric"
+                value={calibrationForm.bottomButtonRegion.x}
+                onChange={(event) => updateBottomButtonRegion("x", event.target.value)}
+              />
+              <input
+                aria-label="底部按钮区域 Y"
+                inputMode="numeric"
+                value={calibrationForm.bottomButtonRegion.y}
+                onChange={(event) => updateBottomButtonRegion("y", event.target.value)}
+              />
+              <input
+                aria-label="底部按钮区域宽度"
+                inputMode="numeric"
+                value={calibrationForm.bottomButtonRegion.width}
+                onChange={(event) => updateBottomButtonRegion("width", event.target.value)}
+              />
+              <input
+                aria-label="底部按钮区域高度"
+                inputMode="numeric"
+                value={calibrationForm.bottomButtonRegion.height}
+                onChange={(event) => updateBottomButtonRegion("height", event.target.value)}
+              />
+            </fieldset>
+          </div>
+          {calibrationResult ? (
+            <dl className="metric-list">
+              <div>
+                <dt>配置路径</dt>
+                <dd>{calibrationResult.path}</dd>
+              </div>
+              <div>
+                <dt>原始截图尺寸</dt>
+                <dd>
+                  {calibrationResult.echo.screenshotSize.width}x
+                  {calibrationResult.echo.screenshotSize.height}
+                </dd>
+              </div>
+              <div>
+                <dt>归一化坐标回显</dt>
+                <dd>
+                  名称 {calibrationResult.echo.nameRegions.map(formatRect).join(" / ")}；锚点{" "}
+                  {calibrationResult.echo.bottomAnchors.map(formatPoint).join(" / ")}；按钮{" "}
+                  {formatRect(calibrationResult.echo.bottomButtonRegion)}
+                </dd>
+              </div>
+            </dl>
+          ) : (
+            <p className="empty-state">暂无校准配置回显。</p>
           )}
         </article>
 
@@ -710,7 +1163,7 @@ function App() {
                 <dd>{overlayReport.visible ? "可见" : "隐藏"}</dd>
               </div>
               <div>
-                <dt>窗口区域</dt>
+                <dt>Overlay 区域</dt>
                 <dd>
                   {overlayReport.bounds.x}, {overlayReport.bounds.y},{" "}
                   {overlayReport.bounds.width}x{overlayReport.bounds.height}
