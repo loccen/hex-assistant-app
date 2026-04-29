@@ -1,0 +1,46 @@
+{
+  "locale": "zh-CN",
+  "version": 1,
+  "augments": [
+    {
+      "id": "prismatic-ticket",
+      "name": "棱彩门票",
+      "aliases": []
+    },
+    {
+      "id": "build-a-bud",
+      "name": "好事成双",
+      "aliases": []
+    },
+    {
+      "id": "trade-sector",
+      "name": "利滚利",
+      "aliases": []
+    },
+    {
+      "id": "pandoras-items",
+      "name": "潘朵拉的装备",
+      "aliases": []
+    },
+    {
+      "id": "jeweled-lotus",
+      "name": "珠光莲花",
+      "aliases": []
+    },
+    {
+      "id": "tiny-titans",
+      "name": "小巨人",
+      "aliases": []
+    },
+    {
+      "id": "ascension",
+      "name": "飞升",
+      "aliases": []
+    },
+    {
+      "id": "cybernetic-bulk",
+      "name": "源计划巨块",
+      "aliases": []
+    }
+  ]
+}

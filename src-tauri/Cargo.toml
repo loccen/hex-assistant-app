@@ -14,6 +14,10 @@ edition = "2021"
 name = "hex_assistant_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[test]]
+name = "overlay"
+path = "src/overlay.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -25,3 +29,32 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"] }
+xcap = "0.9.4"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+scraper = "0.23"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
+[[test]]
+name = "capture"
+path = "src/capture.rs"
+
+[[test]]
+name = "calibration"
+path = "src/calibration.rs"
+
+[[test]]
+name = "apex"
+path = "src/apex.rs"
+
+[[test]]
+name = "live_client"
+path = "src/live_client.rs"
+
+[[test]]
+name = "state_machine"
+path = "src/state_machine.rs"
