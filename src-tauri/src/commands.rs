@@ -160,6 +160,7 @@ pub struct CalibratedNameOcrCommandInput {
     pub preferred_monitor_id: Option<u32>,
 }
 
+#[cfg(not(test))]
 #[tauri::command]
 pub fn run_calibrated_name_ocr(
     app: AppHandle,
@@ -205,6 +206,15 @@ pub fn run_calibrated_name_ocr(
         settings.ocr.min_match_score,
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[tauri::command]
+pub fn run_calibrated_name_ocr(
+    _app: AppHandle,
+    _input: Option<CalibratedNameOcrCommandInput>,
+) -> Result<CalibratedNameOcrReport, String> {
+    Err("HEX-OCR-TEST-STUB: Tauri 命令测试编译不执行 OCR 运行时路径".to_string())
 }
 
 #[tauri::command]
