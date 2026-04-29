@@ -2,6 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
+declare global {
+  interface Window {
+    __HEX_OVERLAY_BOOTSTRAP__?: OverlayPagePayload;
+  }
+}
+
 type DirectoryStatus = {
   key: string;
   path: string;
@@ -291,18 +297,74 @@ type OverlayOperationReport = {
   label: string;
   created: boolean;
   visible: boolean;
+  monitor: {
+    name?: string | null;
+    scaleFactor: string;
+    position: { x: number; y: number };
+    size: { width: number; height: number };
+    workArea: { x: number; y: number; width: number; height: number };
+  };
   bounds: {
     x: number;
     y: number;
     width: number;
     height: number;
   };
+  logicalBounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  cards: OverlayCardInfo[];
   clickThrough: {
     requested: boolean;
     platform: string;
     status: string;
     message: string;
+    childWindowResults: Array<{
+      phase: string;
+      delayMs?: number | null;
+      appliedCount: number;
+      details: string[];
+    }>;
   };
+  logPath?: string | null;
+  messages: string[];
+};
+
+type OverlaySlotData = {
+  slot: number;
+  title: string;
+  body?: string | null;
+  augmentId?: string | null;
+  rank?: string | null;
+  score?: string | null;
+};
+
+type OverlayCardInfo = OverlaySlotData & {
+  body: string;
+  bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  source: string;
+};
+
+type OverlayPagePayload = {
+  generatedAt: string;
+  mode: string;
+  cards: OverlayCardInfo[];
+};
+
+type OverlaySlotUpdateReport = {
+  label: string;
+  visible: boolean;
+  updatedSlots: OverlaySlotData[];
+  logPath?: string | null;
+  message: string;
 };
 
 const statusText: Record<HealthStatus, string> = {
@@ -475,6 +537,11 @@ const apexStatusClass: Record<ApexParseStatus, string> = {
 };
 
 function App() {
+  const isOverlayView = new URLSearchParams(window.location.search).get("view") === "overlay";
+  return isOverlayView ? <OverlayPage /> : <DiagnosticApp />;
+}
+
+function DiagnosticApp() {
   const [overview, setOverview] = useState<RuntimeOverview | null>(null);
   const [health, setHealth] = useState<HealthCheckReport | null>(null);
   const [diagnosticExport, setDiagnosticExport] = useState<DiagnosticExportResult | null>(null);
@@ -492,11 +559,34 @@ function App() {
   const [apexResult, setApexResult] = useState<ApexLookupResult | null>(null);
   const [apexReport, setApexReport] = useState<ApexCacheReport | null>(null);
   const [overlayReport, setOverlayReport] = useState<OverlayOperationReport | null>(null);
+  const [overlayUpdateReport, setOverlayUpdateReport] = useState<OverlaySlotUpdateReport | null>(
+    null,
+  );
   const [ocrTexts, setOcrTexts] = useState({
     leftText: "棱彩门票",
     centerText: "好事成双",
     rightText: "利滚利",
   });
+  const [overlaySlots, setOverlaySlots] = useState([
+    {
+      title: "棱彩门票",
+      body: "当前英雄优先级高，经济线更稳定",
+      rank: "S",
+      score: "4.55",
+    },
+    {
+      title: "好事成双",
+      body: "需要看当前弈子数量，不自动选择",
+      rank: "A",
+      score: "4.72",
+    },
+    {
+      title: "利滚利",
+      body: "经济备选项，等待用户决策",
+      rank: "B",
+      score: "4.91",
+    },
+  ]);
   const [simulator, setSimulator] = useState({
     championName: "Ahri",
     level: 7,
@@ -838,10 +928,10 @@ function App() {
     const data = await runCommand<OverlayOperationReport>("overlay-show", "show_overlay_test_card", {
       request: {
         monitorName: null,
-        anchor: "topRight",
-        width: 360,
-        height: 96,
-        gap: overview?.settings.overlay.gap ?? 8,
+        anchor: "bottomRight",
+        width: 260,
+        height: 118,
+        gap: overview?.settings.overlay.gap ?? 18,
         clickThrough: overview?.settings.overlay.clickThrough ?? true,
       },
     });
@@ -854,6 +944,23 @@ function App() {
     const data = await runCommand<OverlayOperationReport>("overlay-hide", "hide_overlay_test_card");
     if (data) {
       setOverlayReport(data);
+    }
+  }
+
+  async function updateOverlaySlots() {
+    const slots = overlaySlots.map((slot, index) => ({
+      slot: index + 1,
+      title: slot.title,
+      body: slot.body,
+      rank: slot.rank,
+      score: slot.score,
+      augmentId: `manual-slot-${index + 1}`,
+    }));
+    const data = await runCommand<OverlaySlotUpdateReport>("overlay-update", "update_overlay_slots", {
+      slots,
+    });
+    if (data) {
+      setOverlayUpdateReport(data);
     }
   }
 
@@ -1639,6 +1746,32 @@ function App() {
               </button>
             </div>
           </div>
+          <div className="overlay-slot-form">
+            {overlaySlots.map((slot, index) => (
+              <label key={index}>
+                {index + 1} 号卡片
+                <input
+                  value={slot.title}
+                  onChange={(event) => {
+                    const next = [...overlaySlots];
+                    next[index] = { ...slot, title: event.target.value };
+                    setOverlaySlots(next);
+                  }}
+                />
+                <input
+                  value={slot.body}
+                  onChange={(event) => {
+                    const next = [...overlaySlots];
+                    next[index] = { ...slot, body: event.target.value };
+                    setOverlaySlots(next);
+                  }}
+                />
+              </label>
+            ))}
+          </div>
+          <button type="button" onClick={updateOverlaySlots} disabled={busy !== null}>
+            更新真实 slot 数据
+          </button>
           {overlayReport ? (
             <dl className="metric-list">
               <div>
@@ -1653,15 +1786,38 @@ function App() {
                 </dd>
               </div>
               <div>
+                <dt>目标显示器</dt>
+                <dd>
+                  {overlayReport.monitor.name ?? "主显示器"} · {overlayReport.monitor.size.width}x
+                  {overlayReport.monitor.size.height} · scale {overlayReport.monitor.scaleFactor}
+                </dd>
+              </div>
+              <div>
+                <dt>卡片数量</dt>
+                <dd>
+                  {overlayReport.cards.length} 张 ·{" "}
+                  {overlayReport.cards.map((card) => `${card.slot}:${card.source}`).join(" / ")}
+                </dd>
+              </div>
+              <div>
                 <dt>点击穿透</dt>
                 <dd>
                   {overlayReport.clickThrough.status} · {overlayReport.clickThrough.message}
                 </dd>
               </div>
+              <div>
+                <dt>日志</dt>
+                <dd>{overlayReport.logPath ?? "未返回日志路径"}</dd>
+              </div>
             </dl>
           ) : (
             <p className="empty-state">暂无 Overlay 报告。</p>
           )}
+          {overlayUpdateReport ? (
+            <p className="trace-line">
+              {overlayUpdateReport.message} {overlayUpdateReport.logPath ?? ""}
+            </p>
+          ) : null}
         </article>
 
         <article className="panel">
@@ -1714,6 +1870,94 @@ function App() {
       </section>
     </main>
   );
+}
+
+function OverlayPage() {
+  const [payload, setPayload] = useState<OverlayPagePayload>(() => {
+    return (
+      window.__HEX_OVERLAY_BOOTSTRAP__ ?? {
+        generatedAt: new Date().toISOString(),
+        mode: "fallback",
+        cards: fallbackOverlayCards(),
+      }
+    );
+  });
+
+  useEffect(() => {
+    document.documentElement.classList.add("overlay-document");
+    function handleSlotUpdate(event: Event) {
+      const customEvent = event as CustomEvent<OverlaySlotData[]>;
+      setPayload((current) => ({
+        ...current,
+        generatedAt: new Date().toISOString(),
+        mode: "slotData",
+        cards: current.cards.map((card) => {
+          const next = customEvent.detail.find((slot) => slot.slot === card.slot);
+          return next
+            ? {
+                ...card,
+                title: next.title,
+                body: next.body ?? card.body,
+                augmentId: next.augmentId ?? card.augmentId,
+                rank: next.rank ?? card.rank,
+                score: next.score ?? card.score,
+              }
+            : card;
+        }),
+      }));
+    }
+    window.addEventListener("hex-overlay-slots", handleSlotUpdate);
+    return () => {
+      document.documentElement.classList.remove("overlay-document");
+      window.removeEventListener("hex-overlay-slots", handleSlotUpdate);
+    };
+  }, []);
+
+  return (
+    <main className="overlay-root" aria-label="Overlay 测试卡片">
+      {payload.cards.map((card) => (
+        <article
+          key={card.slot}
+          className="overlay-card"
+          style={{
+            left: `${card.bounds.x}px`,
+            top: `${card.bounds.y}px`,
+            width: `${card.bounds.width}px`,
+            height: `${card.bounds.height}px`,
+          }}
+        >
+          <div className="overlay-card-topline">
+            <span>Slot {card.slot}</span>
+            {card.rank ? <strong>{card.rank}</strong> : null}
+          </div>
+          <h1>{card.title}</h1>
+          <p>{card.body}</p>
+          <footer>
+            <span>{card.score ? `均分 ${card.score}` : payload.mode === "static" ? "静态测试" : "实时数据"}</span>
+            <span>{card.augmentId ?? card.source}</span>
+          </footer>
+        </article>
+      ))}
+    </main>
+  );
+}
+
+function fallbackOverlayCards(): OverlayCardInfo[] {
+  return [1, 2, 3].map((slot, index) => ({
+    slot,
+    title: `测试卡片 ${slot}`,
+    body: "Overlay 页面未收到后端初始数据",
+    augmentId: null,
+    rank: null,
+    score: null,
+    bounds: {
+      x: 80 + index * 280,
+      y: 120,
+      width: 260,
+      height: 118,
+    },
+    source: "frontend.fallback",
+  }));
 }
 
 export default App;

@@ -46,7 +46,8 @@ pub fn run() {
             commands::lookup_apex_lol,
             commands::build_apex_cache_report,
             commands::show_overlay_test_card,
-            commands::hide_overlay_test_card
+            commands::hide_overlay_test_card,
+            commands::update_overlay_slots
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
