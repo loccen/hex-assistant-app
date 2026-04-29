@@ -30,7 +30,9 @@ pub fn run() {
             commands::export_release_package,
             commands::write_structured_log,
             commands::capture_monitor_sample,
+            commands::list_capture_monitors,
             commands::save_calibration_profile,
+            commands::save_pixel_calibration_profile,
             commands::load_calibration_profile,
             commands::check_ocr_resources,
             commands::run_ocr_text_replay,
@@ -44,7 +46,8 @@ pub fn run() {
             commands::lookup_apex_lol,
             commands::build_apex_cache_report,
             commands::show_overlay_test_card,
-            commands::hide_overlay_test_card
+            commands::hide_overlay_test_card,
+            commands::update_overlay_slots
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

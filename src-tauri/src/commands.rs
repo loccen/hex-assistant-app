@@ -1,6 +1,8 @@
 use crate::apex::{self, ApexCacheReport, ApexLookupRequest, ApexLookupResult};
-use crate::calibration::{self, CalibrationConfig};
-use crate::capture::{self, CaptureSampleReport};
+use crate::calibration::{
+    self, CalibrationConfig, CalibrationProfileResult, PixelCalibrationInput,
+};
+use crate::capture::{self, CaptureSampleReport, MonitorDiagnostic};
 use crate::diagnostics;
 use crate::live_client::{ActivePlayerSnapshot, LiveClientDataApi};
 use crate::models::{
@@ -11,7 +13,9 @@ use crate::ocr::{
     AUGMENT_DICTIONARY_ZH_CN,
 };
 use crate::orchestrator::{RuntimeLoopSnapshot, RuntimeOrchestratorHandle, RuntimeTriggerRequest};
-use crate::overlay::{self, OverlayOperationReport, OverlayTestCardRequest};
+use crate::overlay::{
+    self, OverlayOperationReport, OverlaySlotData, OverlaySlotUpdateReport, OverlayTestCardRequest,
+};
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{AssistantState, AssistantStateMachine, StateMachineInput};
 use crate::{app_paths::AppPaths, telemetry};
@@ -59,6 +63,12 @@ pub fn capture_monitor_sample(
 }
 
 #[tauri::command]
+pub fn list_capture_monitors() -> Result<Vec<MonitorDiagnostic>, String> {
+    capture::list_monitor_diagnostics()
+        .map_err(|error| format!("HEX-CAPTURE-MONITOR-LIST: {error}"))
+}
+
+#[tauri::command]
 pub fn save_calibration_profile(
     app: AppHandle,
     config: CalibrationConfig,
@@ -70,9 +80,21 @@ pub fn save_calibration_profile(
 }
 
 #[tauri::command]
-pub fn load_calibration_profile(app: AppHandle) -> Result<CalibrationConfig, String> {
+pub fn save_pixel_calibration_profile(
+    app: AppHandle,
+    input: PixelCalibrationInput,
+) -> Result<CalibrationProfileResult, String> {
     let paths = AppPaths::from_app(&app)?;
-    calibration::load_calibration_config(&paths.root)
+    paths.ensure_all()?;
+    calibration::save_pixel_calibration_config(&paths.root, input)
+        .map_err(|error| format!("HEX-CALIBRATION-SAVE: {error}"))
+}
+
+#[tauri::command]
+pub fn load_calibration_profile(app: AppHandle) -> Result<CalibrationProfileResult, String> {
+    let paths = AppPaths::from_app(&app)?;
+    calibration::load_calibration_profile(&paths.root)
+        .map_err(|error| format!("HEX-CALIBRATION-LOAD: {error}"))
 }
 
 #[tauri::command]
@@ -138,6 +160,7 @@ pub struct CalibratedNameOcrCommandInput {
     pub preferred_monitor_id: Option<u32>,
 }
 
+#[cfg(not(test))]
 #[tauri::command]
 pub fn run_calibrated_name_ocr(
     app: AppHandle,
@@ -183,6 +206,15 @@ pub fn run_calibrated_name_ocr(
         settings.ocr.min_match_score,
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[tauri::command]
+pub fn run_calibrated_name_ocr(
+    _app: AppHandle,
+    _input: Option<CalibratedNameOcrCommandInput>,
+) -> Result<CalibratedNameOcrReport, String> {
+    Err("HEX-OCR-TEST-STUB: Tauri 命令测试编译不执行 OCR 运行时路径".to_string())
 }
 
 #[tauri::command]
@@ -258,7 +290,7 @@ pub fn lookup_apex_lol(
         apex::ApexLookupSettings {
             cache_ttl_hours: settings.apex_lol.cache_ttl_hours,
             request_timeout_ms: settings.apex_lol.request_timeout_ms,
-            failed_cache_ttl_minutes: 5,
+            failed_cache_ttl_minutes: settings.apex_lol.failed_cache_ttl_minutes,
         },
     )
 }
@@ -267,7 +299,7 @@ pub fn lookup_apex_lol(
 pub fn build_apex_cache_report(app: AppHandle) -> Result<ApexCacheReport, String> {
     let paths = AppPaths::from_app(&app)?;
     paths.ensure_all()?;
-    apex::build_cache_report(&paths.cache)
+    apex::build_and_write_cache_report(&paths.cache, &paths.reports)
 }
 
 #[tauri::command]
@@ -281,6 +313,14 @@ pub fn show_overlay_test_card(
 #[tauri::command]
 pub fn hide_overlay_test_card(app: AppHandle) -> Result<OverlayOperationReport, String> {
     overlay::hide_overlay_test_card_inner(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn update_overlay_slots(
+    app: AppHandle,
+    slots: Vec<OverlaySlotData>,
+) -> Result<OverlaySlotUpdateReport, String> {
+    overlay::update_overlay_slots_inner(&app, slots).map_err(|error| error.to_string())
 }
 
 fn resource_root(app: &AppHandle) -> std::path::PathBuf {

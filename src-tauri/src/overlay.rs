@@ -1,38 +1,83 @@
 #![allow(dead_code)]
 
+#[cfg(not(test))]
+use crate::app_paths::AppPaths;
+#[cfg(not(test))]
+use crate::calibration::{self, CalibrationConfig, NormalizedPoint};
+#[cfg(test)]
+#[path = "calibration.rs"]
+mod calibration;
+#[cfg(test)]
+use calibration::{CalibrationConfig, NormalizedPoint};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use tauri::{
     AppHandle, LogicalPosition, LogicalSize, Manager, Monitor, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct AppPaths {
+    root: PathBuf,
+    logs: PathBuf,
+}
+
+#[cfg(test)]
+impl AppPaths {
+    fn from_app(_app: &AppHandle) -> Result<Self, String> {
+        Err("测试环境不创建 Tauri 应用数据目录".to_string())
+    }
+
+    fn ensure_all(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 const OVERLAY_LABEL: &str = "hex-assistant-overlay";
-const DEFAULT_WIDTH: u32 = 360;
-const DEFAULT_HEIGHT: u32 = 96;
-const DEFAULT_GAP: i32 = 24;
+const OVERLAY_URL: &str = "index.html?view=overlay";
+const DEFAULT_CARD_WIDTH: u32 = 260;
+const DEFAULT_CARD_HEIGHT: u32 = 118;
+const DEFAULT_GAP: i32 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayTestCardRequest {
     pub monitor_name: Option<String>,
+    #[serde(default = "default_anchor")]
     pub anchor: OverlayAnchor,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub gap: Option<i32>,
+    #[serde(default = "default_click_through")]
     pub click_through: bool,
+    #[serde(default)]
+    pub slots: Vec<OverlaySlotData>,
 }
 
 impl Default for OverlayTestCardRequest {
     fn default() -> Self {
         Self {
             monitor_name: None,
-            anchor: OverlayAnchor::TopRight,
-            width: Some(DEFAULT_WIDTH),
-            height: Some(DEFAULT_HEIGHT),
+            anchor: default_anchor(),
+            width: Some(DEFAULT_CARD_WIDTH),
+            height: Some(DEFAULT_CARD_HEIGHT),
             gap: Some(DEFAULT_GAP),
             click_through: true,
+            slots: Vec::new(),
         }
     }
+}
+
+fn default_anchor() -> OverlayAnchor {
+    OverlayAnchor::BottomRight
+}
+
+fn default_click_through() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +89,17 @@ pub enum OverlayAnchor {
     BottomRight,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlaySlotData {
+    pub slot: u8,
+    pub title: String,
+    pub body: Option<String>,
+    pub augment_id: Option<String>,
+    pub rank: Option<String>,
+    pub score: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayOperationReport {
@@ -53,14 +109,30 @@ pub struct OverlayOperationReport {
     pub creation: OverlayCreationParams,
     pub monitor: OverlayMonitorReport,
     pub bounds: OverlayBounds,
+    pub logical_bounds: OverlayBounds,
+    pub cards: Vec<OverlayCardInfo>,
     pub visibility_changes: Vec<OverlayVisibilityChange>,
     pub click_through: OverlayClickThroughReport,
+    pub log_path: Option<PathBuf>,
+    pub messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlaySlotUpdateReport {
+    pub label: String,
+    pub visible: bool,
+    pub updated_slots: Vec<OverlaySlotData>,
+    pub log_path: Option<PathBuf>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayCreationParams {
+    pub url: String,
     pub transparent: bool,
+    pub background_color: String,
     pub always_on_top: bool,
     pub decorations: bool,
     pub skip_taskbar: bool,
@@ -73,7 +145,9 @@ pub struct OverlayCreationParams {
 impl Default for OverlayCreationParams {
     fn default() -> Self {
         Self {
-            transparent: true,
+            url: OVERLAY_URL.to_string(),
+            transparent: cfg!(not(target_os = "macos")),
+            background_color: "rgba(0,0,0,0)".to_string(),
             always_on_top: true,
             decorations: false,
             skip_taskbar: true,
@@ -129,6 +203,19 @@ pub struct OverlayBounds {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OverlayCardInfo {
+    pub slot: u8,
+    pub title: String,
+    pub body: String,
+    pub augment_id: Option<String>,
+    pub rank: Option<String>,
+    pub score: Option<String>,
+    pub bounds: OverlayBounds,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OverlayVisibilityChange {
     pub from: bool,
     pub to: bool,
@@ -142,6 +229,16 @@ pub struct OverlayClickThroughReport {
     pub platform: String,
     pub status: OverlayClickThroughStatus,
     pub message: String,
+    pub child_window_results: Vec<OverlayChildWindowResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayChildWindowResult {
+    pub phase: String,
+    pub delay_ms: Option<u64>,
+    pub applied_count: usize,
+    pub details: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -170,14 +267,22 @@ pub enum OverlayError {
 impl std::fmt::Display for OverlayError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoMonitor => write!(formatter, "未找到可用显示器"),
-            Self::MonitorNotFound(name) => write!(formatter, "未找到目标显示器: {name}"),
+            Self::NoMonitor => write!(formatter, "HEX-OVERLAY-NO-MONITOR: 未找到可用显示器"),
+            Self::MonitorNotFound(name) => {
+                write!(
+                    formatter,
+                    "HEX-OVERLAY-MONITOR-MISSING: 未找到目标显示器 {name}"
+                )
+            }
             Self::InvalidSize { width, height } => {
-                write!(formatter, "Overlay 尺寸无效: {width}x{height}")
+                write!(
+                    formatter,
+                    "HEX-OVERLAY-BAD-SIZE: Overlay 尺寸无效 {width}x{height}"
+                )
             }
             Self::OutOfBounds { bounds, work_area } => write!(
                 formatter,
-                "Overlay 坐标越界: bounds=({}, {}, {}x{}), workArea=({}, {}, {}x{})",
+                "HEX-OVERLAY-OUT-OF-BOUNDS: bounds=({}, {}, {}x{}), workArea=({}, {}, {}x{})",
                 bounds.x,
                 bounds.y,
                 bounds.width,
@@ -205,34 +310,164 @@ pub fn hide_overlay_test_card(app: AppHandle) -> Result<OverlayOperationReport, 
     hide_overlay_test_card_inner(&app).map_err(|error| error.to_string())
 }
 
+pub fn update_overlay_slots(
+    app: AppHandle,
+    slots: Vec<OverlaySlotData>,
+) -> Result<OverlaySlotUpdateReport, String> {
+    update_overlay_slots_inner(&app, slots).map_err(|error| error.to_string())
+}
+
 pub fn show_overlay_test_card_inner(
     app: &AppHandle,
     request: OverlayTestCardRequest,
 ) -> Result<OverlayOperationReport, OverlayError> {
+    let start = std::time::Instant::now();
+    let paths = prepare_paths(app)?;
+    let mut messages = Vec::new();
+    overlay_debug_log(&paths, "[show] 开始创建 Overlay");
+
     let monitor = select_monitor(app, request.monitor_name.as_deref())?;
     let monitor_report = monitor_to_report(&monitor);
-    let width = request.width.unwrap_or(DEFAULT_WIDTH);
-    let height = request.height.unwrap_or(DEFAULT_HEIGHT);
-    let gap = request.gap.unwrap_or(DEFAULT_GAP);
-    let bounds = plan_overlay_bounds(monitor_report.work_area, request.anchor, width, height, gap)?;
+    let physical_bounds = monitor_bounds(&monitor);
+    let logical_bounds = monitor_logical_bounds(&monitor, physical_bounds);
+    overlay_debug_log(
+        &paths,
+        &format!(
+            "[show] target_monitor name={:?} scale={} physical={}x{}@{},{} workArea={}x{}@{},{} logical={}x{}@{},{}",
+            monitor_report.name,
+            monitor_report.scale_factor,
+            physical_bounds.width,
+            physical_bounds.height,
+            physical_bounds.x,
+            physical_bounds.y,
+            monitor_report.work_area.width,
+            monitor_report.work_area.height,
+            monitor_report.work_area.x,
+            monitor_report.work_area.y,
+            logical_bounds.width,
+            logical_bounds.height,
+            logical_bounds.x,
+            logical_bounds.y,
+        ),
+    );
 
-    let window = match app.get_webview_window(OVERLAY_LABEL) {
-        Some(existing) => {
-            existing.close().map_err(|error| {
-                OverlayError::Tauri(format!("关闭旧 Overlay 窗口失败: {error}"))
-            })?;
-            build_overlay_window(app, &monitor, bounds)?
+    let calibration = match calibration::load_calibration_config(&paths.root) {
+        Ok(config) => {
+            messages.push("已读取校准配置，使用底部锚点生成三张 Overlay 卡片。".to_string());
+            overlay_debug_log(&paths, "[show] calibration=loaded");
+            Some(config)
         }
-        None => build_overlay_window(app, &monitor, bounds)?,
+        Err(error) => {
+            messages.push(format!("未读取到校准配置，使用静态三列测试位置：{error}"));
+            overlay_debug_log(
+                &paths,
+                &format!("[show] calibration=fallback error={error}"),
+            );
+            None
+        }
     };
 
-    apply_overlay_geometry(&window, &monitor, bounds)?;
+    let card_width = request.width.unwrap_or(DEFAULT_CARD_WIDTH);
+    let card_height = request.height.unwrap_or(DEFAULT_CARD_HEIGHT);
+    let gap = request.gap.unwrap_or(DEFAULT_GAP);
+    let cards = plan_overlay_cards(
+        logical_bounds,
+        calibration.as_ref(),
+        &request.slots,
+        card_width,
+        card_height,
+        gap,
+    )?;
+    overlay_debug_log(
+        &paths,
+        &format!(
+            "[show] cards={}",
+            cards
+                .iter()
+                .map(|card| format!(
+                    "slot{}:{}x{}@{},{}:{}",
+                    card.slot,
+                    card.bounds.width,
+                    card.bounds.height,
+                    card.bounds.x,
+                    card.bounds.y,
+                    card.source
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    );
+
+    if let Some(existing) = app.get_webview_window(OVERLAY_LABEL) {
+        overlay_debug_log(&paths, "[show] 关闭旧 Overlay 窗口");
+        existing
+            .close()
+            .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-CLOSE-FAILED: {error}")))?;
+    }
+
+    let payload = OverlayPagePayload {
+        generated_at: Utc::now().to_rfc3339(),
+        mode: if request.slots.is_empty() {
+            "static".to_string()
+        } else {
+            "slotData".to_string()
+        },
+        cards: cards.clone(),
+    };
+    let window = match build_overlay_window(app, &monitor, logical_bounds, &payload) {
+        Ok(window) => window,
+        Err(error) => {
+            overlay_debug_log(&paths, &format!("[show] build_failed {error}"));
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = apply_overlay_geometry(&window, &monitor, physical_bounds) {
+        hide_after_error(&paths, &window, "geometry_failed");
+        return Err(error);
+    }
+
+    if let Err(error) = window.set_focusable(false) {
+        messages.push(format!("设置 Overlay 不抢焦点失败：{error}"));
+        overlay_debug_log(&paths, &format!("[show] set_focusable_failed {error}"));
+    }
+
     #[cfg(windows)]
-    align_window_client_to_requested_bounds(&window);
-    let click_through = apply_click_through(&window, request.click_through);
-    window
-        .show()
-        .map_err(|error| OverlayError::Tauri(format!("显示 Overlay 失败: {error}")))?;
+    {
+        if let Some(result) = align_window_client_to_requested_bounds(&window) {
+            overlay_debug_log(
+                &paths,
+                &format!(
+                    "[show] non_client_align new_outer={},{} offset={},{}",
+                    result.0, result.1, result.2, result.3
+                ),
+            );
+        } else {
+            overlay_debug_log(&paths, "[show] non_client_align skipped_or_failed");
+        }
+    }
+
+    let click_through = apply_click_through(&paths, &window, request.click_through);
+    overlay_debug_log(
+        &paths,
+        &format!(
+            "[show] click_through requested={} status={:?} message={}",
+            click_through.requested, click_through.status, click_through.message
+        ),
+    );
+
+    overlay_debug_log(&paths, "[show] visibility false->true reason=geometryReady");
+    if let Err(error) = window.show() {
+        hide_after_error(&paths, &window, "show_failed");
+        return Err(OverlayError::Tauri(format!(
+            "HEX-OVERLAY-SHOW-FAILED: 显示 Overlay 失败: {error}"
+        )));
+    }
+
+    overlay_debug_log(
+        &paths,
+        &format!("[show] done duration_ms={}", start.elapsed().as_millis()),
+    );
 
     Ok(OverlayOperationReport {
         label: OVERLAY_LABEL.to_string(),
@@ -240,33 +475,40 @@ pub fn show_overlay_test_card_inner(
         visible: true,
         creation: OverlayCreationParams::default(),
         monitor: monitor_report,
-        bounds,
+        bounds: physical_bounds,
+        logical_bounds,
+        cards,
         visibility_changes: vec![OverlayVisibilityChange {
             from: false,
             to: true,
-            reason: "createAndShow".to_string(),
+            reason: "geometryReady".to_string(),
         }],
         click_through,
+        log_path: Some(paths.overlay_debug_log_path()),
+        messages,
     })
 }
 
 pub fn hide_overlay_test_card_inner(
     app: &AppHandle,
 ) -> Result<OverlayOperationReport, OverlayError> {
+    let paths = prepare_paths(app)?;
+    overlay_debug_log(&paths, "[hide] requested");
     let monitor = select_monitor(app, None)?;
     let monitor_report = monitor_to_report(&monitor);
-    let bounds = plan_overlay_bounds(
-        monitor_report.work_area,
-        OverlayAnchor::TopRight,
-        DEFAULT_WIDTH,
-        DEFAULT_HEIGHT,
-        DEFAULT_GAP,
-    )?;
-    let window = app.get_webview_window(OVERLAY_LABEL);
-    if let Some(window) = window {
+    let physical_bounds = monitor_bounds(&monitor);
+    let logical_bounds = monitor_logical_bounds(&monitor, physical_bounds);
+    let mut messages = Vec::new();
+
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
         window
             .hide()
-            .map_err(|error| OverlayError::Tauri(format!("隐藏 Overlay 失败: {error}")))?;
+            .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-HIDE-FAILED: {error}")))?;
+        overlay_debug_log(&paths, "[hide] visibility true->false reason=manualHide");
+        messages.push("Overlay 已隐藏。".to_string());
+    } else {
+        overlay_debug_log(&paths, "[hide] window_not_found");
+        messages.push("Overlay 窗口不存在，无需隐藏。".to_string());
     }
 
     Ok(OverlayOperationReport {
@@ -275,13 +517,61 @@ pub fn hide_overlay_test_card_inner(
         visible: false,
         creation: OverlayCreationParams::default(),
         monitor: monitor_report,
-        bounds,
+        bounds: physical_bounds,
+        logical_bounds,
+        cards: Vec::new(),
         visibility_changes: vec![OverlayVisibilityChange {
             from: true,
             to: false,
-            reason: "hide".to_string(),
+            reason: "manualHide".to_string(),
         }],
         click_through: platform_pending_click_through(false),
+        log_path: Some(paths.overlay_debug_log_path()),
+        messages,
+    })
+}
+
+pub fn update_overlay_slots_inner(
+    app: &AppHandle,
+    slots: Vec<OverlaySlotData>,
+) -> Result<OverlaySlotUpdateReport, OverlayError> {
+    let paths = prepare_paths(app)?;
+    overlay_debug_log(
+        &paths,
+        &format!(
+            "[update_slots] requested slots={}",
+            slots
+                .iter()
+                .map(|slot| format!("{}:{}", slot.slot, slot.title))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    );
+
+    let window = app.get_webview_window(OVERLAY_LABEL).ok_or_else(|| {
+        OverlayError::Tauri(
+            "HEX-OVERLAY-NOT-VISIBLE: Overlay 窗口不存在，请先显示静态测试卡片。".to_string(),
+        )
+    })?;
+    let payload = serde_json::to_string(&slots)
+        .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-SERIALIZE-FAILED: {error}")))?;
+    let script = format!(
+        "window.dispatchEvent(new CustomEvent('hex-overlay-slots', {{ detail: {} }}));",
+        payload
+    );
+    window.eval(script).map_err(|error| {
+        OverlayError::Tauri(format!(
+            "HEX-OVERLAY-UPDATE-FAILED: 更新 slot 数据失败: {error}"
+        ))
+    })?;
+    overlay_debug_log(&paths, "[update_slots] eval_dispatched");
+
+    Ok(OverlaySlotUpdateReport {
+        label: OVERLAY_LABEL.to_string(),
+        visible: true,
+        updated_slots: slots,
+        log_path: Some(paths.overlay_debug_log_path()),
+        message: "已向 Overlay 窗口发送真实 slot 数据更新。".to_string(),
     })
 }
 
@@ -345,6 +635,103 @@ pub fn plan_overlay_bounds(
     Ok(bounds)
 }
 
+fn plan_overlay_cards(
+    target: OverlayBounds,
+    calibration: Option<&CalibrationConfig>,
+    slot_data: &[OverlaySlotData],
+    requested_width: u32,
+    requested_height: u32,
+    gap: i32,
+) -> Result<Vec<OverlayCardInfo>, OverlayError> {
+    if requested_width == 0 || requested_height == 0 {
+        return Err(OverlayError::InvalidSize {
+            width: requested_width,
+            height: requested_height,
+        });
+    }
+
+    let width = requested_width.min(target.width.max(1));
+    let height = requested_height.min(target.height.max(1));
+    let anchors = calibration
+        .map(|config| config.bottom_anchors.to_vec())
+        .unwrap_or_else(default_bottom_anchors);
+    let source = if calibration.is_some() {
+        "calibration.bottomAnchors"
+    } else {
+        "fallback.staticAnchors"
+    };
+
+    anchors
+        .iter()
+        .enumerate()
+        .map(|(index, anchor)| {
+            let slot = u8::try_from(index + 1).unwrap_or(3);
+            let slot_payload = slot_data.iter().find(|candidate| candidate.slot == slot);
+            let bounds = card_bounds_from_anchor(target, *anchor, width, height, gap)?;
+            Ok(OverlayCardInfo {
+                slot,
+                title: slot_payload
+                    .map(|payload| payload.title.clone())
+                    .unwrap_or_else(|| format!("测试卡片 {slot}")),
+                body: slot_payload
+                    .and_then(|payload| payload.body.clone())
+                    .unwrap_or_else(|| "透明置顶点击穿透验证卡片".to_string()),
+                augment_id: slot_payload.and_then(|payload| payload.augment_id.clone()),
+                rank: slot_payload.and_then(|payload| payload.rank.clone()),
+                score: slot_payload.and_then(|payload| payload.score.clone()),
+                bounds,
+                source: source.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn card_bounds_from_anchor(
+    target: OverlayBounds,
+    anchor: NormalizedPoint,
+    width: u32,
+    height: u32,
+    gap: i32,
+) -> Result<OverlayBounds, OverlayError> {
+    let target_width = f64::from(target.width);
+    let target_height = f64::from(target.height);
+    let anchor_x = (anchor.x * target_width).round() as i32;
+    let anchor_y = (anchor.y * target_height).round() as i32;
+    let width_i32 =
+        i32::try_from(width).map_err(|_| OverlayError::InvalidSize { width, height })?;
+    let height_i32 =
+        i32::try_from(height).map_err(|_| OverlayError::InvalidSize { width, height })?;
+    let max_x = i32::try_from(target.width.saturating_sub(width)).unwrap_or(i32::MAX);
+    let max_y = i32::try_from(target.height.saturating_sub(height)).unwrap_or(i32::MAX);
+
+    let x = (anchor_x - width_i32 / 2).clamp(0, max_x);
+    let y = (anchor_y - height_i32 - gap).clamp(0, max_y);
+    let bounds = OverlayBounds {
+        x,
+        y,
+        width,
+        height,
+    };
+    ensure_bounds_inside_work_area(
+        bounds,
+        OverlayRect {
+            x: 0,
+            y: 0,
+            width: target.width,
+            height: target.height,
+        },
+    )?;
+    Ok(bounds)
+}
+
+fn default_bottom_anchors() -> Vec<NormalizedPoint> {
+    vec![
+        NormalizedPoint { x: 0.28, y: 0.84 },
+        NormalizedPoint { x: 0.50, y: 0.84 },
+        NormalizedPoint { x: 0.72, y: 0.84 },
+    ]
+}
+
 fn ensure_bounds_inside_work_area(
     bounds: OverlayBounds,
     work_area: OverlayRect,
@@ -386,33 +773,30 @@ fn select_monitor(app: &AppHandle, monitor_name: Option<&str>) -> Result<Monitor
 fn build_overlay_window(
     app: &AppHandle,
     monitor: &Monitor,
-    bounds: OverlayBounds,
+    logical_bounds: OverlayBounds,
+    payload: &OverlayPagePayload,
 ) -> Result<WebviewWindow, OverlayError> {
-    let url = WebviewUrl::External(
-        "about:blank"
-            .parse()
-            .map_err(|error| OverlayError::Tauri(format!("解析 Overlay URL 失败: {error}")))?,
-    );
-    let (logical_x, logical_y, logical_width, logical_height) = logical_geometry(monitor, bounds);
+    let bootstrap = serde_json::to_string(payload)
+        .map_err(|error| OverlayError::Tauri(format!("序列化 Overlay 初始数据失败: {error}")))?;
+    let mut builder =
+        WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App(OVERLAY_URL.into()))
+            .title("Hex Assistant Overlay")
+            .always_on_top(true)
+            .decorations(false)
+            .skip_taskbar(true)
+            .focused(false)
+            .focusable(false)
+            .resizable(false)
+            .visible(false)
+            .shadow(false)
+            .accept_first_mouse(false)
+            .position(f64::from(logical_bounds.x), f64::from(logical_bounds.y))
+            .inner_size(
+                f64::from(logical_bounds.width),
+                f64::from(logical_bounds.height),
+            )
+            .initialization_script(format!("window.__HEX_OVERLAY_BOOTSTRAP__ = {};", bootstrap));
 
-    let mut builder = WebviewWindowBuilder::new(app, OVERLAY_LABEL, url)
-        .title("Hex Assistant Overlay")
-        .always_on_top(true)
-        .decorations(false)
-        .skip_taskbar(true)
-        .focused(false)
-        .focusable(false)
-        .resizable(false)
-        .visible(false)
-        .shadow(false)
-        .accept_first_mouse(false)
-        .position(logical_x, logical_y)
-        .inner_size(logical_width, logical_height)
-        .visible(false)
-        .initialization_script(test_card_script());
-
-    // 旧 POC 验证过：Windows WebView2 需要在 controller 创建前设置透明背景，
-    // 否则 build 后再改背景色仍可能留下白底或边缘闪烁。
     #[cfg(not(target_os = "macos"))]
     {
         builder = builder
@@ -420,25 +804,25 @@ fn build_overlay_window(
             .background_color(tauri::window::Color(0, 0, 0, 0));
     }
 
+    let _ = monitor;
     builder
         .build()
-        .map_err(|error| OverlayError::Tauri(format!("创建 Overlay 窗口失败: {error}")))
+        .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-BUILD-FAILED: {error}")))
 }
 
 fn apply_overlay_geometry(
     window: &WebviewWindow,
     monitor: &Monitor,
-    bounds: OverlayBounds,
+    physical_bounds: OverlayBounds,
 ) -> Result<(), OverlayError> {
-    let (logical_x, logical_y, logical_width, logical_height) = logical_geometry(monitor, bounds);
-
+    let (logical_x, logical_y, logical_width, logical_height) =
+        logical_geometry(monitor, physical_bounds);
     window
         .set_position(LogicalPosition::new(logical_x, logical_y))
-        .map_err(|error| OverlayError::Tauri(format!("设置 Overlay 坐标失败: {error}")))?;
+        .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-POSITION-FAILED: {error}")))?;
     window
         .set_size(LogicalSize::new(logical_width, logical_height))
-        .map_err(|error| OverlayError::Tauri(format!("设置 Overlay 尺寸失败: {error}")))?;
-
+        .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-SIZE-FAILED: {error}")))?;
     Ok(())
 }
 
@@ -452,29 +836,65 @@ fn logical_geometry(monitor: &Monitor, bounds: OverlayBounds) -> (f64, f64, f64,
     )
 }
 
+fn monitor_bounds(monitor: &Monitor) -> OverlayBounds {
+    OverlayBounds {
+        x: monitor.position().x,
+        y: monitor.position().y,
+        width: monitor.size().width,
+        height: monitor.size().height,
+    }
+}
+
+fn monitor_logical_bounds(monitor: &Monitor, physical_bounds: OverlayBounds) -> OverlayBounds {
+    let (x, y, width, height) = logical_geometry(monitor, physical_bounds);
+    OverlayBounds {
+        x: x.round() as i32,
+        y: y.round() as i32,
+        width: width.round().max(1.0) as u32,
+        height: height.round().max(1.0) as u32,
+    }
+}
+
 #[cfg(windows)]
-fn apply_click_through(window: &WebviewWindow, requested: bool) -> OverlayClickThroughReport {
+fn apply_click_through(
+    paths: &AppPaths,
+    window: &WebviewWindow,
+    requested: bool,
+) -> OverlayClickThroughReport {
     match window.set_ignore_cursor_events(requested) {
         Ok(()) => {
-            let child_count = if requested {
+            let mut child_window_results = Vec::new();
+            if requested {
                 if let Some(hwnd) = window_hwnd(window) {
-                    let count = enumerate_children_transparent(hwnd).len();
-                    schedule_click_through_retries(window.app_handle().clone(), hwnd);
-                    count
+                    let immediate = enumerate_children_transparent(hwnd);
+                    overlay_debug_log(
+                        paths,
+                        &format!(
+                            "[click_through] outer=0x{:x} immediate_count={} details=[{}]",
+                            hwnd,
+                            immediate.len(),
+                            immediate.join(", ")
+                        ),
+                    );
+                    child_window_results.push(OverlayChildWindowResult {
+                        phase: "immediate".to_string(),
+                        delay_ms: None,
+                        applied_count: immediate.len(),
+                        details: immediate,
+                    });
+                    schedule_click_through_retries(paths.clone(), hwnd);
                 } else {
-                    0
+                    overlay_debug_log(paths, "[click_through] window_hwnd_missing");
                 }
-            } else {
-                0
-            };
+            }
             OverlayClickThroughReport {
                 requested,
                 platform: std::env::consts::OS.to_string(),
                 status: OverlayClickThroughStatus::Applied,
-                message: format!(
-                    "set_ignore_cursor_events 已执行；WebView2 子窗口立即补穿透 {} 个，后续会延迟重试。",
-                    child_count
-                ),
+                message:
+                    "set_ignore_cursor_events 已执行；WebView2 子窗口立即补穿透并安排延迟重试。"
+                        .to_string(),
+                child_window_results,
             }
         }
         Err(error) => OverlayClickThroughReport {
@@ -482,12 +902,17 @@ fn apply_click_through(window: &WebviewWindow, requested: bool) -> OverlayClickT
             platform: std::env::consts::OS.to_string(),
             status: OverlayClickThroughStatus::Failed,
             message: format!("set_ignore_cursor_events 执行失败: {error}"),
+            child_window_results: Vec::new(),
         },
     }
 }
 
 #[cfg(not(windows))]
-fn apply_click_through(_window: &WebviewWindow, requested: bool) -> OverlayClickThroughReport {
+fn apply_click_through(
+    _paths: &AppPaths,
+    _window: &WebviewWindow,
+    requested: bool,
+) -> OverlayClickThroughReport {
     platform_pending_click_through(requested)
 }
 
@@ -496,7 +921,9 @@ fn platform_pending_click_through(requested: bool) -> OverlayClickThroughReport 
         requested,
         platform: std::env::consts::OS.to_string(),
         status: OverlayClickThroughStatus::PendingManualAcceptance,
-        message: "非 Windows 平台暂不执行 set_ignore_cursor_events，待真实环境验收".to_string(),
+        message: "非 Windows 平台暂不执行 set_ignore_cursor_events，待 Windows 桌面验收"
+            .to_string(),
+        child_window_results: Vec::new(),
     }
 }
 
@@ -521,20 +948,49 @@ fn monitor_to_report(monitor: &Monitor) -> OverlayMonitorReport {
     }
 }
 
-fn test_card_script() -> &'static str {
-    r#"
-window.addEventListener('DOMContentLoaded', () => {
-  document.documentElement.style.background = 'transparent';
-  document.body.style.margin = '0';
-  document.body.style.background = 'transparent';
-  document.body.innerHTML = `
-    <div style="box-sizing:border-box;width:100vw;height:100vh;padding:12px 16px;border:1px solid rgba(94,234,212,.65);border-radius:8px;background:rgba(12,18,24,.78);box-shadow:0 10px 28px rgba(0,0,0,.28);font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#f8fafc;">
-      <div style="font-size:13px;font-weight:650;line-height:18px;">Hex Assistant Overlay</div>
-      <div style="margin-top:6px;font-size:12px;line-height:16px;color:#cbd5e1;">静态测试卡片 · 透明 · 置顶 · 点击穿透候选</div>
-    </div>
-  `;
-});
-"#
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverlayPagePayload {
+    generated_at: String,
+    mode: String,
+    cards: Vec<OverlayCardInfo>,
+}
+
+fn prepare_paths(app: &AppHandle) -> Result<AppPaths, OverlayError> {
+    let paths = AppPaths::from_app(app).map_err(OverlayError::Tauri)?;
+    paths.ensure_all().map_err(OverlayError::Tauri)?;
+    Ok(paths)
+}
+
+fn hide_after_error(paths: &AppPaths, window: &WebviewWindow, reason: &str) {
+    let _ = window.hide();
+    overlay_debug_log(
+        paths,
+        &format!("[error] visibility true->false reason={reason}"),
+    );
+}
+
+fn overlay_debug_log(paths: &AppPaths, line: &str) {
+    let path = paths.overlay_debug_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let _ = writeln!(file, "[{timestamp}] {line}");
+}
+
+trait OverlayLogPath {
+    fn overlay_debug_log_path(&self) -> PathBuf;
+}
+
+impl OverlayLogPath for AppPaths {
+    fn overlay_debug_log_path(&self) -> PathBuf {
+        self.logs.join("overlay-debug.log")
+    }
 }
 
 #[cfg(windows)]
@@ -559,6 +1015,7 @@ mod win32_ffi {
         ) -> i32;
         pub fn GetWindowRect(hwnd: isize, lp_rect: *mut Rect) -> i32;
         pub fn ClientToScreen(hwnd: isize, lp_point: *mut Point) -> i32;
+        pub fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
     }
 
     #[repr(C)]
@@ -592,10 +1049,8 @@ fn window_hwnd(window: &WebviewWindow) -> Option<isize> {
 }
 
 #[cfg(windows)]
-fn align_window_client_to_requested_bounds(window: &WebviewWindow) {
-    let Some(hwnd) = window_hwnd(window) else {
-        return;
-    };
+fn align_window_client_to_requested_bounds(window: &WebviewWindow) -> Option<(i32, i32, i32, i32)> {
+    let hwnd = window_hwnd(window)?;
     let mut outer = win32_ffi::Rect {
         left: 0,
         top: 0,
@@ -607,27 +1062,49 @@ fn align_window_client_to_requested_bounds(window: &WebviewWindow) {
         if win32_ffi::GetWindowRect(hwnd, &mut outer) == 0
             || win32_ffi::ClientToScreen(hwnd, &mut origin) == 0
         {
-            return;
+            return None;
         }
         let nc_left = origin.x - outer.left;
         let nc_top = origin.y - outer.top;
         let outer_width = outer.right - outer.left;
         let outer_height = outer.bottom - outer.top;
+        let new_x = outer.left - nc_left;
+        let new_y = outer.top - nc_top;
         let _ = win32_ffi::SetWindowPos(
             hwnd,
             0,
-            outer.left - nc_left,
-            outer.top - nc_top,
+            new_x,
+            new_y,
             outer_width,
             outer_height,
             win32_ffi::SWP_NOZORDER | win32_ffi::SWP_NOACTIVATE,
         );
+        Some((new_x, new_y, nc_left, nc_top))
     }
 }
 
 #[cfg(windows)]
+fn is_window_alive(hwnd: isize) -> bool {
+    unsafe { win32_ffi::IsWindow(hwnd) != 0 }
+}
+
+#[cfg(windows)]
+fn get_class_name(hwnd: isize) -> String {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = [0u16; 256];
+    let length =
+        unsafe { win32_ffi::GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if length <= 0 {
+        return "unknown".to_string();
+    }
+    std::ffi::OsString::from_wide(&buffer[..length as usize])
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn make_child_transparent(child_hwnd: isize, lparam: isize) -> i32 {
-    let counter = unsafe { &mut *(lparam as *mut usize) };
+    let collector = unsafe { &mut *(lparam as *mut Vec<String>) };
     let style = unsafe { win32_ffi::GetWindowLongPtrW(child_hwnd, win32_ffi::GWL_EXSTYLE) };
     unsafe {
         win32_ffi::SetWindowLongPtrW(
@@ -636,31 +1113,42 @@ unsafe extern "system" fn make_child_transparent(child_hwnd: isize, lparam: isiz
             style | win32_ffi::WS_EX_TRANSPARENT,
         );
     }
-    *counter += 1;
+    collector.push(format!("{}:0x{:x}", get_class_name(child_hwnd), child_hwnd));
     1
 }
 
 #[cfg(windows)]
 fn enumerate_children_transparent(hwnd: isize) -> Vec<String> {
-    let mut count = 0usize;
-    let lparam = (&mut count as *mut usize) as isize;
+    let mut collector: Vec<String> = Vec::new();
+    let lparam = (&mut collector as *mut Vec<String>) as isize;
     unsafe {
         win32_ffi::EnumChildWindows(hwnd, make_child_transparent, lparam);
     }
-    (0..count).map(|index| format!("child-{index}")).collect()
+    collector
 }
 
 #[cfg(windows)]
-fn schedule_click_through_retries(app: AppHandle, hwnd: isize) {
+fn schedule_click_through_retries(paths: AppPaths, hwnd: isize) {
     std::thread::spawn(move || {
-        let _ = app;
         for delay_ms in [200u64, 700, 2000] {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            let alive = unsafe { win32_ffi::IsWindow(hwnd) != 0 };
-            if !alive {
+            if !is_window_alive(hwnd) {
+                overlay_debug_log(
+                    &paths,
+                    &format!("[click_through_retry] delay_ms={delay_ms} skipped window_closed"),
+                );
                 return;
             }
-            let _ = enumerate_children_transparent(hwnd);
+            let details = enumerate_children_transparent(hwnd);
+            overlay_debug_log(
+                &paths,
+                &format!(
+                    "[click_through_retry] delay_ms={} applied_count={} details=[{}]",
+                    delay_ms,
+                    details.len(),
+                    details.join(", ")
+                ),
+            );
         }
     });
 }
@@ -747,5 +1235,95 @@ mod tests {
                 height: 96
             }
         );
+    }
+
+    #[test]
+    fn plan_overlay_cards_uses_calibration_bottom_anchors() {
+        let config = CalibrationConfig::new(
+            calibration::ScreenshotSize {
+                width: 1920,
+                height: 1080,
+            },
+            [
+                calibration::NormalizedRect {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.1,
+                    height: 0.1,
+                },
+                calibration::NormalizedRect {
+                    x: 0.2,
+                    y: 0.1,
+                    width: 0.1,
+                    height: 0.1,
+                },
+                calibration::NormalizedRect {
+                    x: 0.3,
+                    y: 0.1,
+                    width: 0.1,
+                    height: 0.1,
+                },
+            ],
+            [
+                NormalizedPoint { x: 0.25, y: 0.8 },
+                NormalizedPoint { x: 0.50, y: 0.8 },
+                NormalizedPoint { x: 0.75, y: 0.8 },
+            ],
+            calibration::NormalizedRect {
+                x: 0.4,
+                y: 0.9,
+                width: 0.2,
+                height: 0.05,
+            },
+        );
+
+        let cards = plan_overlay_cards(
+            OverlayBounds {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            Some(&config),
+            &[],
+            260,
+            118,
+            18,
+        )
+        .unwrap();
+
+        assert_eq!(cards.len(), 3);
+        assert_eq!(cards[0].bounds.x, 350);
+        assert_eq!(cards[0].bounds.y, 728);
+        assert_eq!(cards[1].source, "calibration.bottomAnchors");
+    }
+
+    #[test]
+    fn plan_overlay_cards_applies_slot_payload() {
+        let cards = plan_overlay_cards(
+            OverlayBounds {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720,
+            },
+            None,
+            &[OverlaySlotData {
+                slot: 2,
+                title: "棱彩门票".to_string(),
+                body: Some("Apex 推荐".to_string()),
+                augment_id: Some("prismatic-ticket".to_string()),
+                rank: Some("S".to_string()),
+                score: Some("4.55".to_string()),
+            }],
+            240,
+            110,
+            16,
+        )
+        .unwrap();
+
+        assert_eq!(cards[1].title, "棱彩门票");
+        assert_eq!(cards[1].rank.as_deref(), Some("S"));
+        assert_eq!(cards[0].source, "fallback.staticAnchors");
     }
 }
