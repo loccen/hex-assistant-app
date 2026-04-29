@@ -9,12 +9,13 @@ use crate::models::{
 use crate::ocr::{
     self, CalibratedNameSlot, OfflineReplayReport, SlotReplayInput, AUGMENT_DICTIONARY_ZH_CN,
 };
+use crate::orchestrator::{RuntimeLoopSnapshot, RuntimeOrchestratorHandle, RuntimeTriggerRequest};
 use crate::overlay::{self, OverlayOperationReport, OverlayTestCardRequest};
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{AssistantState, AssistantStateMachine, StateMachineInput};
 use crate::{app_paths::AppPaths, telemetry};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
 pub fn get_runtime_overview(app: AppHandle) -> Result<RuntimeOverview, String> {
@@ -153,6 +154,39 @@ pub fn evaluate_state_machine(
         state: machine.state().clone(),
         events,
     })
+}
+
+#[tauri::command]
+pub fn get_runtime_orchestrator_status(
+    orchestrator: State<RuntimeOrchestratorHandle>,
+) -> Result<RuntimeLoopSnapshot, String> {
+    orchestrator.snapshot()
+}
+
+#[tauri::command]
+pub fn trigger_runtime_orchestrator(
+    app: AppHandle,
+    orchestrator: State<RuntimeOrchestratorHandle>,
+    request: RuntimeTriggerRequest,
+) -> Result<RuntimeLoopSnapshot, String> {
+    orchestrator.trigger_once(&app, request)
+}
+
+#[tauri::command]
+pub fn start_runtime_listener(
+    app: AppHandle,
+    orchestrator: State<RuntimeOrchestratorHandle>,
+    request: RuntimeTriggerRequest,
+) -> Result<RuntimeLoopSnapshot, String> {
+    orchestrator.start_listener(&app, request)
+}
+
+#[tauri::command]
+pub fn stop_runtime_listener(
+    app: AppHandle,
+    orchestrator: State<RuntimeOrchestratorHandle>,
+) -> Result<RuntimeLoopSnapshot, String> {
+    orchestrator.stop_listener(&app)
 }
 
 #[tauri::command]

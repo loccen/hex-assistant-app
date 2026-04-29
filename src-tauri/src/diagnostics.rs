@@ -147,6 +147,15 @@ pub fn health_check(app: &AppHandle) -> Result<HealthCheckReport, String> {
     });
     let state_machine_report = run_state_machine_self_check();
     items.push(state_machine_report);
+    items.push(HealthCheckItem {
+        key: "runtime-orchestrator".to_string(),
+        name: "局内闭环编排器".to_string(),
+        status: HealthStatus::NotChecked,
+        details:
+            "命令已接入；低频监听只读取 Live Client 本地接口并复用已校准面板状态，健康检查不主动访问游戏接口"
+                .to_string(),
+        error_code: None,
+    });
     let apex_cache_report = apex::build_cache_report(&paths.cache);
     items.push(HealthCheckItem {
         key: "apex-lol".to_string(),
@@ -395,9 +404,10 @@ fn run_state_machine_self_check() -> HealthCheckItem {
         name: "状态机离线模拟".to_string(),
         status: HealthStatus::Pass,
         details: format!(
-            "状态 {:?}，待选阶段 {:?}，事件数 {}",
+            "状态 {:?}，待选阶段 {:?}，待处理档位 {:?}，事件数 {}",
             machine.state().status,
             machine.state().pending_tier,
+            machine.state().pending_tiers,
             events.len()
         ),
         error_code: None,

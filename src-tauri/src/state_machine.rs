@@ -84,6 +84,7 @@ pub struct AssistantState {
     pub status: AssistantStatus,
     pub player: Option<LivePlayerSnapshot>,
     pub pending_tier: Option<u8>,
+    pub pending_tiers: Vec<u8>,
     pub completed_tiers: BTreeSet<u8>,
     pub panel_state: PanelState,
     pub visible_choices: BTreeMap<u8, String>,
@@ -96,6 +97,7 @@ impl Default for AssistantState {
             status: AssistantStatus::WaitingForGame,
             player: None,
             pending_tier: None,
+            pending_tiers: Vec::new(),
             completed_tiers: BTreeSet::new(),
             panel_state: PanelState::Collapsed,
             visible_choices: BTreeMap::new(),
@@ -159,12 +161,15 @@ impl AssistantStateMachine {
             .state
             .player
             .as_ref()
-            .and_then(|player| next_pending_tier(player.level, &self.state.completed_tiers));
+            .map(|player| pending_tiers(player.level, &self.state.completed_tiers))
+            .unwrap_or_default();
+        self.state.pending_tiers = eligible_tier.clone();
 
-        if let Some(tier) = eligible_tier {
+        if let Some(tier) = eligible_tier.first().copied() {
             self.ensure_pending_tier(tier, &mut events);
         } else {
             self.state.pending_tier = None;
+            self.state.pending_tiers.clear();
             self.state.visible_choices.clear();
         }
 
@@ -180,7 +185,13 @@ impl AssistantStateMachine {
             {
                 let from_status = self.state.status;
                 self.state.completed_tiers.insert(tier);
-                self.state.pending_tier = None;
+                self.state.pending_tiers = self
+                    .state
+                    .player
+                    .as_ref()
+                    .map(|player| pending_tiers(player.level, &self.state.completed_tiers))
+                    .unwrap_or_default();
+                self.state.pending_tier = self.state.pending_tiers.first().copied();
                 self.state.visible_choices.clear();
                 self.state.status = status_after_completion(
                     self.state.player.as_ref().map(|player| player.level),
@@ -224,6 +235,7 @@ impl AssistantStateMachine {
             (Some(previous), Some(next)) if previous.champion_name != next.champion_name => {
                 self.state.completed_tiers.clear();
                 self.state.pending_tier = None;
+                self.state.pending_tiers.clear();
                 self.state.visible_choices.clear();
                 events.push(self.event(
                     StateEventKind::PlayerChanged,
@@ -373,6 +385,14 @@ fn next_pending_tier(level: u8, completed_tiers: &BTreeSet<u8>) -> Option<u8> {
         .iter()
         .copied()
         .find(|tier| level >= *tier && !completed_tiers.contains(tier))
+}
+
+fn pending_tiers(level: u8, completed_tiers: &BTreeSet<u8>) -> Vec<u8> {
+    AUGMENT_TIERS
+        .iter()
+        .copied()
+        .filter(|tier| level >= *tier && !completed_tiers.contains(tier))
+        .collect()
 }
 
 fn status_after_completion(level: Option<u8>, completed_tiers: &BTreeSet<u8>) -> AssistantStatus {
