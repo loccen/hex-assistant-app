@@ -9,7 +9,9 @@ use crate::models::{
 use crate::ocr::{
     self, CalibratedNameSlot, OfflineReplayReport, SlotReplayInput, AUGMENT_DICTIONARY_ZH_CN,
 };
-use crate::overlay::{self, OverlayOperationReport, OverlayTestCardRequest};
+use crate::overlay::{
+    self, OverlayOperationReport, OverlaySlotData, OverlaySlotUpdateReport, OverlayTestCardRequest,
+};
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{AssistantState, AssistantStateMachine, StateMachineInput};
 use crate::{app_paths::AppPaths, telemetry};
@@ -192,6 +194,14 @@ pub fn show_overlay_test_card(
 #[tauri::command]
 pub fn hide_overlay_test_card(app: AppHandle) -> Result<OverlayOperationReport, String> {
     overlay::hide_overlay_test_card_inner(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn update_overlay_slots(
+    app: AppHandle,
+    slots: Vec<OverlaySlotData>,
+) -> Result<OverlaySlotUpdateReport, String> {
+    overlay::update_overlay_slots_inner(&app, slots).map_err(|error| error.to_string())
 }
 
 fn resource_root(app: &AppHandle) -> std::path::PathBuf {
