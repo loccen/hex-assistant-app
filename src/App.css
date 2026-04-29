@@ -202,9 +202,31 @@ input {
   font: inherit;
 }
 
-input:focus {
+select {
+  min-width: 0;
+  min-height: 38px;
+  width: 100%;
+  padding: 0 10px;
+  border: 1px solid #c8d2df;
+  border-radius: 6px;
+  color: #182230;
+  background: #ffffff;
+  font: inherit;
+}
+
+input:focus,
+select:focus {
   outline: 2px solid #84c5f4;
   outline-offset: 1px;
+}
+
+.field-stack {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+  color: #536173;
+  font-size: 0.82rem;
+  font-weight: 700;
 }
 
 .checkbox-label {
@@ -229,6 +251,44 @@ input:focus {
   display: grid;
   gap: 8px;
   margin-top: 14px;
+}
+
+.wide-panel {
+  grid-column: 1 / -1;
+}
+
+.size-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.calibration-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.calibration-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #dce3ec;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.calibration-group legend {
+  padding: 0 4px;
+  color: #536173;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.calibration-group.point-group {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .result-row {
@@ -451,6 +511,11 @@ input:focus {
   }
 
   .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .size-grid,
+  .calibration-grid {
     grid-template-columns: 1fr;
   }
 

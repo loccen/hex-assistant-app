@@ -1,6 +1,8 @@
 use crate::apex::{self, ApexCacheReport, ApexLookupRequest, ApexLookupResult};
-use crate::calibration::{self, CalibrationConfig};
-use crate::capture::{self, CaptureSampleReport};
+use crate::calibration::{
+    self, CalibrationConfig, CalibrationProfileResult, PixelCalibrationInput,
+};
+use crate::capture::{self, CaptureSampleReport, MonitorDiagnostic};
 use crate::diagnostics;
 use crate::live_client::{ActivePlayerSnapshot, LiveClientDataApi};
 use crate::models::{
@@ -59,6 +61,12 @@ pub fn capture_monitor_sample(
 }
 
 #[tauri::command]
+pub fn list_capture_monitors() -> Result<Vec<MonitorDiagnostic>, String> {
+    capture::list_monitor_diagnostics()
+        .map_err(|error| format!("HEX-CAPTURE-MONITOR-LIST: {error}"))
+}
+
+#[tauri::command]
 pub fn save_calibration_profile(
     app: AppHandle,
     config: CalibrationConfig,
@@ -70,9 +78,21 @@ pub fn save_calibration_profile(
 }
 
 #[tauri::command]
-pub fn load_calibration_profile(app: AppHandle) -> Result<CalibrationConfig, String> {
+pub fn save_pixel_calibration_profile(
+    app: AppHandle,
+    input: PixelCalibrationInput,
+) -> Result<CalibrationProfileResult, String> {
     let paths = AppPaths::from_app(&app)?;
-    calibration::load_calibration_config(&paths.root)
+    paths.ensure_all()?;
+    calibration::save_pixel_calibration_config(&paths.root, input)
+        .map_err(|error| format!("HEX-CALIBRATION-SAVE: {error}"))
+}
+
+#[tauri::command]
+pub fn load_calibration_profile(app: AppHandle) -> Result<CalibrationProfileResult, String> {
+    let paths = AppPaths::from_app(&app)?;
+    calibration::load_calibration_profile(&paths.root)
+        .map_err(|error| format!("HEX-CALIBRATION-LOAD: {error}"))
 }
 
 #[tauri::command]
