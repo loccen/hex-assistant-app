@@ -2,7 +2,7 @@
 
 本文说明 LOL 海克斯助手发布包应包含的文件、Windows 打包命令、运行方式、已知限制、诊断包导出和验收记录要求。
 
-当前仓库位于 `/home/code/hex-assistant-app`。旧 POC 仓库 `/home/code/hex-assistant` 只作为历史验证来源，不能作为正式发布目录。
+当前说明面向正式项目 worktree。旧 POC 仓库 `/home/code/hex-assistant` 只作为历史验证来源，不能作为正式发布目录。
 
 ## 1. 当前状态
 
@@ -15,33 +15,28 @@
 正式发布归档建议使用以下结构：
 
 ```text
-release/
-  README.md
-  验证记录.md
-  packages/
-    Hex Assistant.exe 或安装包
-    *.msi 或 *setup.exe
-    checksums.txt
+README.txt
+hex-assistant-app.exe
+WebView2Loader.dll
+resources/
+  dictionaries/
+    augments.zh-CN.json
   models/
-    ppocr-v4-rec.onnx
-    ppocr-v4-rec.json 或等价字典 / 元数据文件
-  runtime/
+    ppocrv4_rec.onnx
+  onnxruntime/
     onnxruntime.dll
-    其他 ONNX Runtime 依赖库
-  docs/
-    运行说明.md
-    已知限制.md
-    诊断包导出说明.md
-  diagnostics/
-    示例诊断包或空目录说明
+    onnxruntime_providers_shared.dll
+checksums.txt
+release-manifest.json
 ```
 
 最低要求：
 
-- 必须包含可执行文件或安装包。
+- 必须包含 Windows 可执行文件。
+- 必须包含 `WebView2Loader.dll`。
 - 必须包含 OCR 模型文件，不能依赖开发机上的 pip 包目录或源码相对路径。
 - 必须包含 Windows 运行所需的 ORT 动态库，例如 `onnxruntime.dll`。
-- 必须包含运行说明、已知限制、诊断包导出说明和验证记录。
+- 必须包含不超过 80 行的 `README.txt`，说明运行方式、已包含 OCR 资源、诊断包导出和 Windows 真机验收项。
 - 必须记录构建机器、构建时间、提交号、产物路径和校验值。
 
 如果某项资源暂未打入发布包，发布说明必须写成“缺失 / 待补齐”，不能写成可用。
@@ -71,19 +66,20 @@ mise exec -- cargo check --manifest-path src-tauri/Cargo.toml
 mise exec -- cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-在 Windows 终端进入仓库根目录后生成 Windows 安装包：
+生成 Windows GNU exe：
 
 ```bash
-mise exec -- npm run tauri build
+mise exec -- npm run build:windows
 ```
 
-当前 WSL 环境可生成 Linux 产物：
+等价的拆分命令：
 
 ```bash
-mise exec -- npm run tauri build -- --bundles deb
+mise exec -- npm run build
+mise exec -- cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-gnu
 ```
 
-Windows `exe` / `msi` 需要 Windows runner，或满足 Tauri Windows 交叉编译所需工具链和依赖后另行验证。WSL 下的 `.deb` 不能替代 Windows Overlay、点击穿透、真实截图或局内流程验收。
+本项目最终交付只发布 Windows 用户包。不要把 Linux 产物、前端源码、`dist/` 或长文档目录打进用户 zip。
 
 如需只验证 Rust 工程：
 
@@ -103,16 +99,16 @@ mise exec -- npm run tauri dev
 mise exec -- npm run release:zip
 ```
 
-该脚本会输出 `release/hex-assistant-release-*.zip`，包含前端产物、发布文档、资源目录、已存在的可执行文件 / 安装包候选、`release-manifest.json` 和 `checksums.txt`。当前资源目录已包含真实 OCR 模型和 Windows ORT 动态库；如果缺少 Windows 安装包，manifest 和文档只能记录“缺失 / 待补齐”，不能写成 Windows 发布已通过。
+该脚本会输出 `release/hex-assistant-release-*.zip`，只包含 Windows exe、`WebView2Loader.dll`、`resources/` 下的 OCR / ORT 资源、`README.txt`、`release-manifest.json` 和 `checksums.txt`。该包不包含 `dist/`、`docs/`、Linux installers、deb/rpm/appimage 或源码；如果缺少 Windows exe，脚本会失败并拒绝生成用户包。
 
 打包产物通常位于：
 
 ```text
-src-tauri/target/release/
-src-tauri/target/release/bundle/
+src-tauri/target/x86_64-pc-windows-gnu/release/hex-assistant-app.exe
+src-tauri/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll
 ```
 
-实际路径以 Tauri 构建日志为准。发布时应复制最终安装包、可执行文件、模型、ORT 动态库和说明文档到 `release/` 下的归档目录，并生成校验值。
+实际路径以构建日志为准。发布时应复制最终 Windows 可执行文件、WebView2Loader、模型、ORT 动态库和简短说明到 release zip，并生成校验值。
 
 ## 4. 运行前检查
 

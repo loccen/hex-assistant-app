@@ -17,6 +17,10 @@ run = "npm run build"
 description = "检查 Tauri Rust 工程"
 run = "cargo check --manifest-path src-tauri/Cargo.toml"
 
+[tasks.windows-gnu-build]
+description = "构建 Windows GNU x64 可执行文件"
+run = "npm run build:windows"
+
 [tasks.dev]
 description = "启动 Tauri 开发模式"
 run = "npm run tauri dev"
