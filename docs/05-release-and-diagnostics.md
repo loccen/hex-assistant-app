@@ -113,7 +113,7 @@ src-tauri/resources/models/*
 src-tauri/resources/onnxruntime/*
 ```
 
-仓库当前只包含词库和模型 / ORT 资源说明文件，真实 `ppocrv4_rec.onnx`、`onnxruntime.dll` 及其依赖 DLL 仍需发布前补入，并在 Windows 验证记录中写明加载结果。
+仓库当前已在 Tauri resources 中随包包含 `ppocrv4_rec.onnx`、Windows x64 ONNX Runtime 1.25.0 `onnxruntime.dll`、包内 `onnxruntime_providers_shared.dll`、ONNX Runtime LICENSE 和 ThirdPartyNotices。Windows 真实启动、模型加载和动态库加载仍需在干净 Windows 桌面环境单独验收，并在验证记录中写明加载结果。
 
 ## 5. 运行说明
 

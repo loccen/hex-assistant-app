@@ -702,9 +702,9 @@ fn release_resource_inventory(workspace_root: &Path) -> serde_json::Value {
         "models": list_relative_files(&resources, &resources.join("models")),
         "onnxruntime": list_relative_files(&resources, &resources.join("onnxruntime")),
         "requiredRuntimeNotes": [
-            "PP-OCRv4 rec ONNX 模型需随包放入 resources/models。",
-            "Windows ORT 动态库需随包放入 resources/onnxruntime，至少包含 onnxruntime.dll。",
-            "当前 README 文件是资源占位和获取说明，不等同于真实模型或动态库。"
+            "PP-OCRv4 rec ONNX 模型应随包放入 resources/models。",
+            "Windows ORT 动态库应随包放入 resources/onnxruntime，至少包含 onnxruntime.dll。",
+            "当前资源目录已包含真实 OCR 模型、Windows x64 ONNX Runtime 1.25.0 动态库和许可说明；Windows 真实加载仍需单独验收。"
         ]
     })
 }

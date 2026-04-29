@@ -54,7 +54,7 @@ resources/models/*
 resources/onnxruntime/*
 ```
 
-仓库当前包含 `src-tauri/resources/models/README.md` 和 `src-tauri/resources/onnxruntime/README.md` 作为资源占位说明，真实模型和动态库仍需随 Windows 发布补入。
+仓库当前已随 Tauri resources 包含真实 `src-tauri/resources/models/ppocrv4_rec.onnx`、Windows x64 ONNX Runtime 1.25.0 `src-tauri/resources/onnxruntime/onnxruntime.dll`、包内 `onnxruntime_providers_shared.dll`、ONNX Runtime LICENSE 和 ThirdPartyNotices。Windows `exe` / `msi` 生成、干净 Windows 环境启动、模型加载和动态库加载仍需单独验收。
 
 ## 3. 打包与导出命令
 
@@ -103,7 +103,7 @@ mise exec -- npm run tauri dev
 mise exec -- npm run release:zip
 ```
 
-该脚本会输出 `release/hex-assistant-release-*.zip`，包含前端产物、发布文档、资源目录、已存在的可执行文件 / 安装包候选、`release-manifest.json` 和 `checksums.txt`。如果缺少 Windows 安装包、真实 OCR 模型或 ORT 动态库，manifest 和文档只能记录“缺失 / 待补齐”，不能写成已通过。
+该脚本会输出 `release/hex-assistant-release-*.zip`，包含前端产物、发布文档、资源目录、已存在的可执行文件 / 安装包候选、`release-manifest.json` 和 `checksums.txt`。当前资源目录已包含真实 OCR 模型和 Windows ORT 动态库；如果缺少 Windows 安装包，manifest 和文档只能记录“缺失 / 待补齐”，不能写成 Windows 发布已通过。
 
 打包产物通常位于：
 
