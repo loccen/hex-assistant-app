@@ -19,6 +19,7 @@ use crate::overlay::{
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{AssistantState, AssistantStateMachine, StateMachineInput};
 use crate::{app_paths::AppPaths, telemetry};
+use base64::{engine::general_purpose, Engine};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
@@ -60,6 +61,33 @@ pub fn capture_monitor_sample(
     let paths = AppPaths::from_app(&app)?;
     paths.ensure_all()?;
     capture::capture_monitor_sample(&paths.root, preferred_monitor_id)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PngDataUrlResult {
+    pub path: std::path::PathBuf,
+    pub data_url: String,
+    pub bytes: usize,
+}
+
+#[tauri::command]
+pub fn read_png_file_as_data_url(path: std::path::PathBuf) -> Result<PngDataUrlResult, String> {
+    let bytes = std::fs::read(&path).map_err(|error| {
+        format!(
+            "HEX-CAPTURE-PREVIEW-READ: 无法读取截图 {}: {error}",
+            path.display()
+        )
+    })?;
+    let data_url = format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(&bytes)
+    );
+    Ok(PngDataUrlResult {
+        path,
+        bytes: bytes.len(),
+        data_url,
+    })
 }
 
 #[tauri::command]
@@ -213,6 +241,54 @@ pub fn run_calibrated_name_ocr(
 pub fn run_calibrated_name_ocr(
     _app: AppHandle,
     _input: Option<CalibratedNameOcrCommandInput>,
+) -> Result<CalibratedNameOcrReport, String> {
+    Err("HEX-OCR-TEST-STUB: Tauri 命令测试编译不执行 OCR 运行时路径".to_string())
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+pub fn run_pixel_calibrated_name_ocr(
+    app: AppHandle,
+    input: PixelCalibrationInput,
+    screenshot_path: std::path::PathBuf,
+) -> Result<CalibratedNameOcrReport, String> {
+    let paths = AppPaths::from_app(&app)?;
+    paths.ensure_all()?;
+    let settings = load_or_create_settings(&paths)?;
+    let calibration = calibration::build_calibration_config_from_pixels(input)
+        .map_err(|error| format!("HEX-CALIBRATION-OCR-CHECK: {error}"))?;
+    let resource_root = resource_root(&app);
+    let resource_status = ocr::check_ppocr_resources(&resource_root);
+    if !resource_status.ready {
+        return Err(resource_status.message);
+    }
+
+    let dictionary_path = resource_root
+        .join("dictionaries")
+        .join(AUGMENT_DICTIONARY_ZH_CN);
+    let dictionary =
+        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+    let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
+        .map_err(|error| error.to_string())?;
+
+    ocr::recognize_calibrated_name_slots_from_image(
+        &mut recognizer,
+        &dictionary,
+        &calibration,
+        &screenshot_path,
+        &paths.reports,
+        settings.ocr.min_confidence,
+        settings.ocr.min_match_score,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[tauri::command]
+pub fn run_pixel_calibrated_name_ocr(
+    _app: AppHandle,
+    _input: PixelCalibrationInput,
+    _screenshot_path: std::path::PathBuf,
 ) -> Result<CalibratedNameOcrReport, String> {
     Err("HEX-OCR-TEST-STUB: Tauri 命令测试编译不执行 OCR 运行时路径".to_string())
 }
