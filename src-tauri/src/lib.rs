@@ -32,6 +32,7 @@ pub fn run() {
             commands::load_calibration_profile,
             commands::check_ocr_resources,
             commands::run_ocr_text_replay,
+            commands::run_calibrated_name_ocr,
             commands::fetch_live_client_active_player,
             commands::evaluate_state_machine,
             commands::lookup_apex_lol,

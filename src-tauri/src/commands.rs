@@ -7,7 +7,8 @@ use crate::models::{
     DiagnosticExportResult, HealthCheckReport, RuntimeOverview, TelemetryEvent, TelemetryEventInput,
 };
 use crate::ocr::{
-    self, CalibratedNameSlot, OfflineReplayReport, SlotReplayInput, AUGMENT_DICTIONARY_ZH_CN,
+    self, CalibratedNameOcrReport, CalibratedNameSlot, OfflineReplayReport, SlotReplayInput,
+    AUGMENT_DICTIONARY_ZH_CN,
 };
 use crate::overlay::{self, OverlayOperationReport, OverlayTestCardRequest};
 use crate::settings::load_or_create_settings;
@@ -127,6 +128,60 @@ pub fn run_ocr_text_replay(
     ocr::write_offline_replay_report(&paths.ocr_replay, &report)
         .map_err(|error| error.to_string())?;
     Ok(report)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibratedNameOcrCommandInput {
+    pub screenshot_path: Option<std::path::PathBuf>,
+    pub preferred_monitor_id: Option<u32>,
+}
+
+#[tauri::command]
+pub fn run_calibrated_name_ocr(
+    app: AppHandle,
+    input: Option<CalibratedNameOcrCommandInput>,
+) -> Result<CalibratedNameOcrReport, String> {
+    let paths = AppPaths::from_app(&app)?;
+    paths.ensure_all()?;
+    let settings = load_or_create_settings(&paths)?;
+    let calibration = calibration::load_calibration_config(&paths.root)?;
+    let resource_root = resource_root(&app);
+    let resource_status = ocr::check_ppocr_resources(&resource_root);
+    if !resource_status.ready {
+        return Err(resource_status.message);
+    }
+
+    let dictionary_path = resource_root
+        .join("dictionaries")
+        .join(AUGMENT_DICTIONARY_ZH_CN);
+    let dictionary =
+        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+    let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
+        .map_err(|error| error.to_string())?;
+    let input = input.unwrap_or(CalibratedNameOcrCommandInput {
+        screenshot_path: None,
+        preferred_monitor_id: None,
+    });
+    let screenshot_path = match input.screenshot_path {
+        Some(path) => path,
+        None => {
+            let capture_report =
+                capture::capture_monitor_sample(&paths.root, input.preferred_monitor_id)?;
+            capture_report.png_path
+        }
+    };
+
+    ocr::recognize_calibrated_name_slots_from_image(
+        &mut recognizer,
+        &dictionary,
+        &calibration,
+        &screenshot_path,
+        &paths.reports,
+        settings.ocr.min_confidence,
+        settings.ocr.min_match_score,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
