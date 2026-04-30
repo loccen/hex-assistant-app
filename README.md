@@ -6,15 +6,18 @@ LOL 海克斯助手是一个 Tauri 2 + Rust + React + TypeScript 桌面应用。
 
 ## 当前阶段
 
-第一阶段只完成正式项目骨架：
+当前仓库已完成正式项目骨架，并实现了主要功能模块的代码与基础验证：
 
-- Tauri 2 桌面应用骨架。
-- React + TypeScript 前端骨架。
-- Rust 后端入口。
-- `mise.toml` 项目运行时配置。
-- `docs/` 项目需求、架构、验收和实施依据。
+- Tauri 2 + React + TypeScript 桌面应用主界面与 Overlay 页面。
+- `mise.toml` 运行时配置、应用数据目录、结构化日志和诊断导出。
+- 显示器枚举、截图采样、黑屏 / 旧帧诊断和用户校准。
+- PP-OCRv4 rec ONNX OCR、词库匹配和离线回放。
+- Live Client Data API、状态机和低频监听编排。
+- Overlay 布局、窗口控制和点击穿透处理。
+- ApexLOL 查询、解析、缓存和失败兜底。
+- `docs/` 项目需求、架构、验收、发布和实施依据。
 
-截图、校准、OCR、Live Client Data API、Overlay、ApexLOL 查询和本地缓存会按阶段逐步实现。
+当前状态更接近“主要链路已实现，Windows 实机验收仍待补齐”，而不是“仅骨架阶段”。WSL 环境下已完成基础构建和 Rust 测试；真实截图、Overlay 点击穿透、模型 / 动态库随包加载和局内端到端流程仍需在 Windows 桌面环境单独验收。
 
 ## 运行方式
 
