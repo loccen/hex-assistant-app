@@ -70,6 +70,13 @@ pub fn capture_monitor_sample(
     capture::capture_monitor_sample(&paths.root, preferred_monitor_id)
 }
 
+#[tauri::command]
+pub fn load_latest_capture_sample(app: AppHandle) -> Result<CaptureSampleReport, String> {
+    let paths = AppPaths::from_app(&app)?;
+    paths.ensure_all()?;
+    capture::load_latest_capture_sample(&paths.root)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PngDataUrlResult {
