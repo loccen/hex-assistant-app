@@ -16,12 +16,17 @@ use crate::orchestrator::{RuntimeLoopSnapshot, RuntimeOrchestratorHandle, Runtim
 use crate::overlay::{
     self, OverlayOperationReport, OverlaySlotData, OverlaySlotUpdateReport, OverlayTestCardRequest,
 };
+use crate::resource_paths;
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{AssistantState, AssistantStateMachine, StateMachineInput};
 use crate::{app_paths::AppPaths, telemetry};
 use base64::{engine::general_purpose, Engine};
+#[cfg(not(test))]
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+#[cfg(not(test))]
+use std::time::Instant;
+use tauri::{AppHandle, State};
 
 #[tauri::command]
 pub fn get_runtime_overview(app: AppHandle) -> Result<RuntimeOverview, String> {
@@ -127,7 +132,9 @@ pub fn load_calibration_profile(app: AppHandle) -> Result<CalibrationProfileResu
 
 #[tauri::command]
 pub fn check_ocr_resources(app: AppHandle) -> Result<ocr::OcrResourceStatus, String> {
-    Ok(ocr::check_ppocr_resources(resource_root(&app)))
+    Ok(ocr::check_ppocr_resources(resource_paths::resource_root(
+        &app,
+    )))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,7 +154,7 @@ pub fn run_ocr_text_replay(
     let paths = AppPaths::from_app(&app)?;
     paths.ensure_all()?;
     let settings = load_or_create_settings(&paths)?;
-    let dictionary_path = resource_root(&app)
+    let dictionary_path = resource_paths::resource_root(&app)
         .join("dictionaries")
         .join(AUGMENT_DICTIONARY_ZH_CN);
     let dictionary =
@@ -190,7 +197,7 @@ pub struct CalibratedNameOcrCommandInput {
 
 #[cfg(not(test))]
 #[tauri::command]
-pub fn run_calibrated_name_ocr(
+pub async fn run_calibrated_name_ocr(
     app: AppHandle,
     input: Option<CalibratedNameOcrCommandInput>,
 ) -> Result<CalibratedNameOcrReport, String> {
@@ -198,47 +205,82 @@ pub fn run_calibrated_name_ocr(
     paths.ensure_all()?;
     let settings = load_or_create_settings(&paths)?;
     let calibration = calibration::load_calibration_config(&paths.root)?;
-    let resource_root = resource_root(&app);
-    let resource_status = ocr::check_ppocr_resources(&resource_root);
-    if !resource_status.ready {
-        return Err(resource_status.message);
-    }
-
-    let dictionary_path = resource_root
-        .join("dictionaries")
-        .join(AUGMENT_DICTIONARY_ZH_CN);
-    let dictionary =
-        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
-    let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
-        .map_err(|error| error.to_string())?;
     let input = input.unwrap_or(CalibratedNameOcrCommandInput {
         screenshot_path: None,
         preferred_monitor_id: None,
     });
-    let screenshot_path = match input.screenshot_path {
-        Some(path) => path,
-        None => {
-            let capture_report =
-                capture::capture_monitor_sample(&paths.root, input.preferred_monitor_id)?;
-            capture_report.png_path
+    let preferred_monitor_id = input.preferred_monitor_id;
+    let screenshot_path = input.screenshot_path.clone();
+    let trace_id = telemetry::new_trace_id("ocr-check");
+    write_ocr_telemetry(
+        &paths,
+        &trace_id,
+        "info",
+        None,
+        "ocr-check-start",
+        format!(
+            "开始执行 OCR 校验 command=run_calibrated_name_ocr screenshot={} preferred_monitor_id={}",
+            screenshot_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "自动截图".to_string()),
+            preferred_monitor_id
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "未指定".to_string())
+        ),
+        "等待后台线程完成 OCR 初始化与推理".to_string(),
+        0,
+    );
+    let resource_root = resource_paths::resource_root(&app);
+    let paths_for_task = paths.clone();
+    let start = Instant::now();
+    let join_result = tauri::async_runtime::spawn_blocking(move || {
+        let resource_status = ocr::check_ppocr_resources(&resource_root);
+        if !resource_status.ready {
+            return Err(resource_status.message);
         }
-    };
 
-    ocr::recognize_calibrated_name_slots_from_image(
-        &mut recognizer,
-        &dictionary,
-        &calibration,
-        &screenshot_path,
-        &paths.reports,
-        settings.ocr.min_confidence,
-        settings.ocr.min_match_score,
+        let dictionary_path = resource_root
+            .join("dictionaries")
+            .join(AUGMENT_DICTIONARY_ZH_CN);
+        let dictionary =
+            ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+        let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
+            .map_err(|error| error.to_string())?;
+        let screenshot_path = match screenshot_path {
+            Some(path) => path,
+            None => {
+                let capture_report =
+                    capture::capture_monitor_sample(&paths_for_task.root, preferred_monitor_id)?;
+                capture_report.png_path
+            }
+        };
+
+        ocr::recognize_calibrated_name_slots_from_image(
+            &mut recognizer,
+            &dictionary,
+            &calibration,
+            &screenshot_path,
+            &paths_for_task.reports,
+            settings.ocr.min_confidence,
+            settings.ocr.min_match_score,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await;
+
+    finalize_ocr_telemetry(
+        &paths,
+        &trace_id,
+        "run_calibrated_name_ocr",
+        start,
+        join_result,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 #[tauri::command]
-pub fn run_calibrated_name_ocr(
+pub async fn run_calibrated_name_ocr(
     _app: AppHandle,
     _input: Option<CalibratedNameOcrCommandInput>,
 ) -> Result<CalibratedNameOcrReport, String> {
@@ -247,7 +289,7 @@ pub fn run_calibrated_name_ocr(
 
 #[cfg(not(test))]
 #[tauri::command]
-pub fn run_pixel_calibrated_name_ocr(
+pub async fn run_pixel_calibrated_name_ocr(
     app: AppHandle,
     input: PixelCalibrationInput,
     screenshot_path: std::path::PathBuf,
@@ -257,35 +299,62 @@ pub fn run_pixel_calibrated_name_ocr(
     let settings = load_or_create_settings(&paths)?;
     let calibration = calibration::build_calibration_config_from_pixels(input)
         .map_err(|error| format!("HEX-CALIBRATION-OCR-CHECK: {error}"))?;
-    let resource_root = resource_root(&app);
-    let resource_status = ocr::check_ppocr_resources(&resource_root);
-    if !resource_status.ready {
-        return Err(resource_status.message);
-    }
+    let screenshot_summary = screenshot_path.display().to_string();
+    let trace_id = telemetry::new_trace_id("ocr-check");
+    write_ocr_telemetry(
+        &paths,
+        &trace_id,
+        "info",
+        None,
+        "ocr-check-start",
+        format!(
+            "开始执行 OCR 校验 command=run_pixel_calibrated_name_ocr screenshot={screenshot_summary}"
+        ),
+        "等待后台线程完成 OCR 初始化与推理".to_string(),
+        0,
+    );
+    let resource_root = resource_paths::resource_root(&app);
+    let paths_for_task = paths.clone();
+    let start = Instant::now();
+    let join_result = tauri::async_runtime::spawn_blocking(move || {
+        let resource_status = ocr::check_ppocr_resources(&resource_root);
+        if !resource_status.ready {
+            return Err(resource_status.message);
+        }
 
-    let dictionary_path = resource_root
-        .join("dictionaries")
-        .join(AUGMENT_DICTIONARY_ZH_CN);
-    let dictionary =
-        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
-    let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
-        .map_err(|error| error.to_string())?;
+        let dictionary_path = resource_root
+            .join("dictionaries")
+            .join(AUGMENT_DICTIONARY_ZH_CN);
+        let dictionary =
+            ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+        let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
+            .map_err(|error| error.to_string())?;
 
-    ocr::recognize_calibrated_name_slots_from_image(
-        &mut recognizer,
-        &dictionary,
-        &calibration,
-        &screenshot_path,
-        &paths.reports,
-        settings.ocr.min_confidence,
-        settings.ocr.min_match_score,
+        ocr::recognize_calibrated_name_slots_from_image(
+            &mut recognizer,
+            &dictionary,
+            &calibration,
+            &screenshot_path,
+            &paths_for_task.reports,
+            settings.ocr.min_confidence,
+            settings.ocr.min_match_score,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await;
+
+    finalize_ocr_telemetry(
+        &paths,
+        &trace_id,
+        "run_pixel_calibrated_name_ocr",
+        start,
+        join_result,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 #[tauri::command]
-pub fn run_pixel_calibrated_name_ocr(
+pub async fn run_pixel_calibrated_name_ocr(
     _app: AppHandle,
     _input: PixelCalibrationInput,
     _screenshot_path: std::path::PathBuf,
@@ -399,15 +468,95 @@ pub fn update_overlay_slots(
     overlay::update_overlay_slots_inner(&app, slots).map_err(|error| error.to_string())
 }
 
-fn resource_root(app: &AppHandle) -> std::path::PathBuf {
-    app.path()
-        .resource_dir()
-        .ok()
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join("src-tauri")
-                .join("resources")
-        })
+#[cfg(not(test))]
+fn finalize_ocr_telemetry(
+    paths: &AppPaths,
+    trace_id: &str,
+    command_name: &str,
+    start: Instant,
+    join_result: Result<Result<CalibratedNameOcrReport, String>, tauri::Error>,
+) -> Result<CalibratedNameOcrReport, String> {
+    let duration_ms = start.elapsed().as_millis();
+    match join_result {
+        Ok(Ok(report)) => {
+            let slot_summary = report
+                .slots
+                .iter()
+                .map(|slot| {
+                    format!(
+                        "{}:{}",
+                        slot.slot.as_str(),
+                        slot.final_name
+                            .clone()
+                            .unwrap_or_else(|| slot.raw_text.clone())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            write_ocr_telemetry(
+                paths,
+                trace_id,
+                "info",
+                None,
+                "ocr-check-success",
+                format!("OCR 校验完成 command={command_name}"),
+                format!("识别完成，slots={slot_summary}"),
+                duration_ms,
+            );
+            Ok(report)
+        }
+        Ok(Err(error)) => {
+            write_ocr_telemetry(
+                paths,
+                trace_id,
+                "error",
+                Some("HEX-OCR-CHECK-FAILED"),
+                "ocr-check-failed",
+                format!("OCR 校验失败 command={command_name}"),
+                error.clone(),
+                duration_ms,
+            );
+            Err(error)
+        }
+        Err(error) => {
+            let message = format!("后台 OCR 任务执行失败: {error}");
+            write_ocr_telemetry(
+                paths,
+                trace_id,
+                "error",
+                Some("HEX-OCR-CHECK-JOIN"),
+                "ocr-check-failed",
+                format!("OCR 校验线程失败 command={command_name}"),
+                message.clone(),
+                duration_ms,
+            );
+            Err(message)
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn write_ocr_telemetry(
+    paths: &AppPaths,
+    trace_id: &str,
+    level: &str,
+    error_code: Option<&str>,
+    stage: &str,
+    input_summary: String,
+    message: String,
+    duration_ms: u128,
+) {
+    let event = TelemetryEvent {
+        timestamp: Utc::now().to_rfc3339(),
+        trace_id: trace_id.to_string(),
+        stage: stage.to_string(),
+        input_summary,
+        output_summary: format!("日志文件 {}", paths.app_log_path().display()),
+        duration_ms,
+        level: level.to_string(),
+        error_code: error_code.map(|value| value.to_string()),
+        message,
+    };
+
+    let _ = telemetry::append_event(paths, &event);
 }

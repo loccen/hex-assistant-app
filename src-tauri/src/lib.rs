@@ -9,6 +9,7 @@ pub mod models;
 mod ocr;
 mod orchestrator;
 mod overlay;
+mod resource_paths;
 mod settings;
 mod state_machine;
 mod telemetry;

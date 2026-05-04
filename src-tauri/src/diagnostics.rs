@@ -9,6 +9,7 @@ use crate::models::{
 };
 use crate::ocr;
 use crate::overlay::{self, OverlayAnchor, OverlayRect};
+use crate::resource_paths;
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{
     AssistantStateMachine, AugmentChoice, LivePlayerSnapshot, PanelState, StateMachineInput,
@@ -21,7 +22,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
@@ -123,7 +124,7 @@ pub fn health_check(app: &AppHandle) -> Result<HealthCheckReport, String> {
         },
         error_code: (!calibration_path.exists()).then(|| "HEX-CALIBRATION-MISSING".to_string()),
     });
-    let ocr_status = ocr::check_ppocr_resources(resource_root(app));
+    let ocr_status = ocr::check_ppocr_resources(resource_paths::resource_root(app));
     items.push(HealthCheckItem {
         key: "ocr-model".to_string(),
         name: "OCR 模型文件".to_string(),
@@ -874,14 +875,6 @@ fn current_git_commit(workspace_root: &Path) -> Option<String> {
 
 fn timestamp_for_filename() -> String {
     Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
-}
-
-fn resource_root(app: &AppHandle) -> PathBuf {
-    app.path()
-        .resource_dir()
-        .ok()
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| workspace_root().join("src-tauri").join("resources"))
 }
 
 fn workspace_root() -> PathBuf {
