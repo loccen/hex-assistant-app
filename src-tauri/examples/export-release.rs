@@ -1,4 +1,4 @@
-use hex_assistant_app_lib::diagnostics::build_release_package;
+use hex_assistant_app_lib::diagnostics::{build_release_package, release_extract_dir_for_zip};
 
 fn main() {
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -10,6 +10,10 @@ fn main() {
     match build_release_package(&workspace_root, &trace_id) {
         Ok(result) => {
             println!("release 压缩包已生成: {}", result.zip_path.display());
+            println!(
+                "release 解压目录已覆盖: {}",
+                release_extract_dir_for_zip(&result.zip_path).display()
+            );
             println!("trace_id: {}", result.trace_id);
             println!("文件数: {}", result.included_files);
         }

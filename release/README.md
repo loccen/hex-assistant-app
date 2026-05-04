@@ -99,7 +99,7 @@ mise exec -- npm run tauri dev
 mise exec -- npm run release:zip
 ```
 
-该脚本会输出 `release/hex-assistant-release-*.zip`，只包含 Windows exe、`WebView2Loader.dll`、`resources/` 下的 OCR / ORT 资源、`README.txt`、`release-manifest.json` 和 `checksums.txt`。该包不包含 `dist/`、`docs/`、Linux installers、deb/rpm/appimage 或源码；如果缺少 Windows exe，脚本会失败并拒绝生成用户包。
+该脚本会固定覆盖 `release/hex-assistant-release.zip`，并同步覆盖解压到 `release/hex-assistant-release/`。该包只包含 Windows exe、`WebView2Loader.dll`、`resources/` 下的 OCR / ORT 资源、`README.txt`、`release-manifest.json` 和 `checksums.txt`。该包不包含 `dist/`、`docs/`、Linux installers、deb/rpm/appimage 或源码；如果缺少 Windows exe，脚本会失败并拒绝生成用户包。
 
 打包产物通常位于：
 
@@ -108,7 +108,7 @@ src-tauri/target/x86_64-pc-windows-gnu/release/hex-assistant-app.exe
 src-tauri/target/x86_64-pc-windows-gnu/release/WebView2Loader.dll
 ```
 
-实际路径以构建日志为准。发布时应复制最终 Windows 可执行文件、WebView2Loader、模型、ORT 动态库和简短说明到 release zip，并生成校验值。
+实际路径以构建日志为准。发布时会把最终 Windows 可执行文件、WebView2Loader、模型、ORT 动态库和简短说明写入固定 zip，并直接覆盖解压结果，便于立刻进入 `release/hex-assistant-release/` 做真机测试。
 
 ## 4. 运行前检查
 

@@ -28,7 +28,12 @@ mise exec -- npm run build:windows
 mise exec -- npm run release:zip
 ```
 
-该命令会生成面向用户的 `release/hex-assistant-release-*.zip`，结构只包含 Windows 可执行文件、`WebView2Loader.dll`、`resources/` OCR / ORT 资源、`README.txt`、`release-manifest.json` 和 `checksums.txt`。release zip 不包含 `dist/`、`docs/`、Linux installers、deb/rpm/appimage 或源码。如果当前环境没有 Windows exe，脚本会失败并拒绝生成用户包。
+该命令会固定覆盖 `release/hex-assistant-release.zip`，并在成功后同步覆盖解压到 `release/hex-assistant-release/`。zip 内结构只包含 Windows 可执行文件、`WebView2Loader.dll`、`resources/` OCR / ORT 资源、`README.txt`、`release-manifest.json` 和 `checksums.txt`。release zip 不包含 `dist/`、`docs/`、Linux installers、deb/rpm/appimage 或源码。如果当前环境没有 Windows exe，脚本会失败并拒绝生成用户包。
+
+这样做的目的有两个：
+
+- 避免每次导出都在 `release/` 目录下累积新的时间戳压缩包，持续推高仓库体积。
+- 保持一个固定的解压目录，便于直接在 Windows 中进入 `release/hex-assistant-release/` 双击 `hex-assistant-app.exe` 复测。
 
 开发运行：
 

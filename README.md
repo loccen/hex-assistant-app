@@ -37,6 +37,15 @@ mise exec -- cargo check --manifest-path src-tauri/Cargo.toml
 mise exec -- npm run tauri dev
 ```
 
+生成用于 Windows 测试的 release 包：
+
+```bash
+mise exec -- npm run build:windows
+mise exec -- npm run release:zip
+```
+
+该命令会固定覆盖 `release/hex-assistant-release.zip`，并同步覆盖解压到 `release/hex-assistant-release/`，方便直接打开其中的 `hex-assistant-app.exe` 做真机测试。
+
 说明：真实截图、Overlay 点击穿透和 LOL 局内流程必须在 Windows 桌面环境中验收，不能只依赖 WSL。
 
 ## 安全边界

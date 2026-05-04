@@ -25,6 +25,11 @@ use tauri::{AppHandle, Manager};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
+const RELEASE_ZIP_NAME: &str = "hex-assistant-release.zip";
+const RELEASE_ZIP_STAGING_NAME: &str = "hex-assistant-release.next.zip";
+const RELEASE_EXTRACTED_DIR_NAME: &str = "hex-assistant-release";
+const RELEASE_EXTRACTED_STAGING_DIR_NAME: &str = "hex-assistant-release.next";
+
 pub fn initialize(app: &AppHandle) -> Result<RuntimeOverview, String> {
     let start = Instant::now();
     let paths = AppPaths::from_app(app)?;
@@ -302,8 +307,9 @@ pub fn export_release_package(app: &AppHandle) -> Result<DiagnosticExportResult,
             stage: "release-export".to_string(),
             input_summary: "生成 release 压缩包".to_string(),
             output_summary: format!(
-                "{}，文件数 {}",
+                "{}，已解压到 {}，文件数 {}",
                 result.zip_path.display(),
+                release_extract_dir_for_zip(&result.zip_path).display(),
                 result.included_files
             ),
             duration_ms: start.elapsed().as_millis(),
@@ -357,13 +363,34 @@ pub fn build_release_package(
     let release_dir = workspace_root.join("release");
     fs::create_dir_all(&release_dir)
         .map_err(|error| format!("无法创建 release 目录 {}: {error}", release_dir.display()))?;
-    let zip_path = release_dir.join(format!(
-        "hex-assistant-release-{}.zip",
-        timestamp_for_filename()
-    ));
+    let zip_path = release_dir.join(RELEASE_ZIP_NAME);
+    let staging_zip_path = release_dir.join(RELEASE_ZIP_STAGING_NAME);
+    let extracted_dir = release_dir.join(RELEASE_EXTRACTED_DIR_NAME);
+    let staging_extracted_dir = release_dir.join(RELEASE_EXTRACTED_STAGING_DIR_NAME);
 
-    let zip_file = File::create(&zip_path)
-        .map_err(|error| format!("无法创建 release 压缩包 {}: {error}", zip_path.display()))?;
+    if staging_zip_path.exists() {
+        fs::remove_file(&staging_zip_path).map_err(|error| {
+            format!(
+                "无法清理旧的临时 release 压缩包 {}: {error}",
+                staging_zip_path.display()
+            )
+        })?;
+    }
+    if staging_extracted_dir.exists() {
+        fs::remove_dir_all(&staging_extracted_dir).map_err(|error| {
+            format!(
+                "无法清理旧的临时 release 解压目录 {}: {error}",
+                staging_extracted_dir.display()
+            )
+        })?;
+    }
+
+    let zip_file = File::create(&staging_zip_path).map_err(|error| {
+        format!(
+            "无法创建临时 release 压缩包 {}: {error}",
+            staging_zip_path.display()
+        )
+    })?;
     let mut zip = zip::ZipWriter::new(zip_file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut included_files = 0usize;
@@ -473,6 +500,34 @@ pub fn build_release_package(
     zip.finish()
         .map_err(|error| format!("无法完成 release 压缩包写入: {error}"))?;
 
+    if zip_path.exists() {
+        fs::remove_file(&zip_path).map_err(|error| {
+            format!("无法覆盖旧 release 压缩包 {}: {error}", zip_path.display())
+        })?;
+    }
+    fs::rename(&staging_zip_path, &zip_path).map_err(|error| {
+        format!(
+            "无法将临时 release 压缩包移动到最终位置 {}: {error}",
+            zip_path.display()
+        )
+    })?;
+
+    extract_release_bundle(&zip_path, &staging_extracted_dir)?;
+    if extracted_dir.exists() {
+        fs::remove_dir_all(&extracted_dir).map_err(|error| {
+            format!(
+                "无法覆盖旧 release 解压目录 {}: {error}",
+                extracted_dir.display()
+            )
+        })?;
+    }
+    fs::rename(&staging_extracted_dir, &extracted_dir).map_err(|error| {
+        format!(
+            "无法将临时 release 解压目录移动到最终位置 {}: {error}",
+            extracted_dir.display()
+        )
+    })?;
+
     let result = DiagnosticExportResult {
         trace_id: trace_id.to_string(),
         zip_path: zip_path.clone(),
@@ -480,6 +535,10 @@ pub fn build_release_package(
     };
 
     Ok(result)
+}
+
+pub fn release_extract_dir_for_zip(zip_path: &Path) -> PathBuf {
+    zip_path.with_extension("")
 }
 
 fn run_state_machine_self_check() -> HealthCheckItem {
@@ -637,6 +696,53 @@ fn add_bytes_to_zip_as(
         .map_err(|error| format!("无法写入 release 文件 {entry_name}: {error}"))?;
     checksums.push((entry_name, format!("{:x}", Sha256::digest(content))));
     Ok(1)
+}
+
+fn extract_release_bundle(zip_path: &Path, target_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(target_dir).map_err(|error| {
+        format!(
+            "无法创建 release 解压目录 {}: {error}",
+            target_dir.display()
+        )
+    })?;
+
+    let zip_file = File::open(zip_path)
+        .map_err(|error| format!("无法打开 release 压缩包 {}: {error}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(zip_file)
+        .map_err(|error| format!("无法读取 release 压缩包 {}: {error}", zip_path.display()))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            format!(
+                "无法读取 release 压缩包中的第 {index} 个条目 {}: {error}",
+                zip_path.display()
+            )
+        })?;
+        let enclosed_name = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("release 压缩包包含不安全路径 {}，拒绝解压", entry.name()))?;
+        let output_path = target_dir.join(enclosed_name);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&output_path).map_err(|error| {
+                format!("无法创建 release 目录 {}: {error}", output_path.display())
+            })?;
+            continue;
+        }
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("无法创建 release 父目录 {}: {error}", parent.display())
+            })?;
+        }
+
+        let mut output_file = File::create(&output_path)
+            .map_err(|error| format!("无法写入 release 文件 {}: {error}", output_path.display()))?;
+        std::io::copy(&mut entry, &mut output_file)
+            .map_err(|error| format!("无法解压 release 文件 {}: {error}", output_path.display()))?;
+    }
+
+    Ok(())
 }
 
 fn release_root_readme() -> String {
@@ -877,6 +983,10 @@ mod tests {
         let result =
             build_release_package(&workspace, "release-test").expect("应能生成 release 包");
         assert!(result.included_files >= 4);
+        assert_eq!(
+            result.zip_path,
+            workspace.join("release").join(RELEASE_ZIP_NAME)
+        );
 
         let file = File::open(&result.zip_path).expect("应能打开 release 包");
         let mut archive = zip::ZipArchive::new(file).expect("应能读取 release zip");
@@ -907,6 +1017,194 @@ mod tests {
             .by_name("installers/linux/hex-assistant-app.deb")
             .is_err());
         assert!(archive.by_name("checksums.txt").is_ok());
+        assert_eq!(
+            fs::read(
+                workspace
+                    .join("release")
+                    .join(RELEASE_EXTRACTED_DIR_NAME)
+                    .join("hex-assistant-app.exe")
+            )
+            .expect("应能读取解压后的 exe"),
+            b"pe-stub /index.html"
+        );
+        assert_eq!(
+            fs::read(
+                workspace
+                    .join("release")
+                    .join(RELEASE_EXTRACTED_DIR_NAME)
+                    .join("resources")
+                    .join("models")
+                    .join("ppocrv4_rec.onnx")
+            )
+            .expect("应能读取解压后的模型"),
+            b"model"
+        );
+        assert_eq!(
+            fs::read(
+                workspace
+                    .join("release")
+                    .join(RELEASE_EXTRACTED_DIR_NAME)
+                    .join("WebView2Loader.dll")
+            )
+            .expect("应能读取解压后的 WebView2Loader.dll"),
+            b"webview"
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn release_package_overwrites_previous_zip_and_extract_dir() {
+        let workspace = temp_workspace("release-package-overwrite");
+        fs::create_dir_all(workspace.join("dist")).expect("应能创建 dist");
+        fs::create_dir_all(workspace.join("src-tauri").join("resources").join("models"))
+            .expect("应能创建 resources/models");
+        fs::create_dir_all(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("dictionaries"),
+        )
+        .expect("应能创建 dictionaries");
+        fs::create_dir_all(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("onnxruntime"),
+        )
+        .expect("应能创建 onnxruntime");
+        fs::create_dir_all(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release"),
+        )
+        .expect("应能创建 Windows target 目录");
+
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("dictionaries")
+                .join("augments.zh-CN.json"),
+            "[]\n",
+        )
+        .expect("应能写入词库");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("models")
+                .join("ppocrv4_rec.onnx"),
+            b"model-v1",
+        )
+        .expect("应能写入模型");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("onnxruntime")
+                .join("onnxruntime.dll"),
+            b"ort-v1",
+        )
+        .expect("应能写入 ORT DLL");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("onnxruntime")
+                .join("onnxruntime_providers_shared.dll"),
+            b"provider-v1",
+        )
+        .expect("应能写入 ORT provider DLL");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release")
+                .join("hex-assistant-app.exe"),
+            b"pe-stub-v1 /index.html",
+        )
+        .expect("应能写入 Windows exe");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release")
+                .join("WebView2Loader.dll"),
+            b"webview-v1",
+        )
+        .expect("应能写入 WebView2Loader.dll");
+
+        let first_result =
+            build_release_package(&workspace, "release-overwrite-1").expect("第一次打包应成功");
+        let extracted_dir = workspace.join("release").join(RELEASE_EXTRACTED_DIR_NAME);
+        fs::write(extracted_dir.join("stale.txt"), "stale\n").expect("应能写入旧垃圾文件");
+
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release")
+                .join("hex-assistant-app.exe"),
+            b"pe-stub-v2 /index.html",
+        )
+        .expect("应能更新 Windows exe");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("target")
+                .join("x86_64-pc-windows-gnu")
+                .join("release")
+                .join("WebView2Loader.dll"),
+            b"webview-v2",
+        )
+        .expect("应能更新 WebView2Loader.dll");
+        fs::write(
+            workspace
+                .join("src-tauri")
+                .join("resources")
+                .join("models")
+                .join("ppocrv4_rec.onnx"),
+            b"model-v2",
+        )
+        .expect("应能更新模型");
+        let second_result =
+            build_release_package(&workspace, "release-overwrite-2").expect("第二次打包应成功");
+
+        assert_eq!(first_result.zip_path, second_result.zip_path);
+        assert!(!extracted_dir.join("stale.txt").exists());
+        assert_eq!(
+            fs::read(extracted_dir.join("hex-assistant-app.exe")).expect("应能读取更新后的 exe"),
+            b"pe-stub-v2 /index.html"
+        );
+        assert_eq!(
+            fs::read(extracted_dir.join("WebView2Loader.dll"))
+                .expect("应能读取更新后的 WebView2Loader.dll"),
+            b"webview-v2"
+        );
+        assert_eq!(
+            fs::read(
+                extracted_dir
+                    .join("resources")
+                    .join("models")
+                    .join("ppocrv4_rec.onnx")
+            )
+            .expect("应能读取更新后的模型"),
+            b"model-v2"
+        );
+        assert!(!workspace
+            .join("release")
+            .join(RELEASE_ZIP_STAGING_NAME)
+            .exists());
+        assert!(!workspace
+            .join("release")
+            .join(RELEASE_EXTRACTED_STAGING_DIR_NAME)
+            .exists());
 
         let _ = fs::remove_dir_all(workspace);
     }
