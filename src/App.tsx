@@ -368,6 +368,18 @@ function PlayerApp() {
     if (!data) {
       return;
     }
+    await loadCaptureIntoCalibration(data, "截图完成，可以关闭或离开自定义游戏。");
+  }
+
+  async function loadLatestCapture() {
+    const data = await runCommand<CaptureSampleReport>("latest-capture", "load_latest_capture_sample");
+    if (!data) {
+      return;
+    }
+    await loadCaptureIntoCalibration(data, "已加载最近截图样本，可以直接继续校准。");
+  }
+
+  async function loadCaptureIntoCalibration(data: CaptureSampleReport, successMessage: string) {
     setCapture(data);
     setOcrReport(null);
     setMarks(emptyMarkState());
@@ -377,7 +389,7 @@ function PlayerApp() {
     });
     if (imageData) {
       setScreenshot(imageData);
-      setToast({ tone: "success", message: "截图完成，可以关闭或离开自定义游戏。" });
+      setToast({ tone: "success", message: successMessage });
     }
   }
 
@@ -467,6 +479,7 @@ function PlayerApp() {
           ocrReport={ocrReport}
           onRefreshMonitors={loadMonitors}
           onCapture={captureAfterDelay}
+          onLoadLatestCapture={loadLatestCapture}
           onRunOcrCheck={runOcrCheck}
           onSave={saveCalibration}
         />
@@ -581,6 +594,7 @@ function CalibrationWizard({
   ocrReport,
   onRefreshMonitors,
   onCapture,
+  onLoadLatestCapture,
   onRunOcrCheck,
   onSave,
 }: {
@@ -603,6 +617,7 @@ function CalibrationWizard({
   ocrReport: CalibratedNameOcrReport | null;
   onRefreshMonitors: () => void;
   onCapture: () => void;
+  onLoadLatestCapture: () => void;
   onRunOcrCheck: () => void;
   onSave: () => void;
 }) {
@@ -617,6 +632,7 @@ function CalibrationWizard({
           <li>在游戏设置中选择无边框。</li>
           <li>回到助手，选择目标显示器。</li>
           <li>点击“5 秒后截图”，立刻切回游戏并等待。</li>
+          <li>如果之前已经截过图，也可以直接点击“加载最近截图”。</li>
           <li>截图完成后可以关闭或离开游戏。</li>
         </ol>
         <div className="capture-controls">
@@ -640,6 +656,9 @@ function CalibrationWizard({
           <div className="button-row">
             <button type="button" onClick={onRefreshMonitors} disabled={busy !== null}>
               刷新显示器
+            </button>
+            <button type="button" onClick={onLoadLatestCapture} disabled={busy !== null}>
+              加载最近截图
             </button>
             <button type="button" onClick={onCapture} disabled={busy !== null || countdown !== null}>
               {countdown ? `${countdown} 秒后截图` : "5 秒后截图"}

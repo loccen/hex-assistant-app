@@ -56,6 +56,7 @@ pub fn run() {
             commands::export_release_package,
             commands::write_structured_log,
             commands::capture_monitor_sample,
+            commands::load_latest_capture_sample,
             commands::read_png_file_as_data_url,
             commands::list_capture_monitors,
             commands::save_calibration_profile,

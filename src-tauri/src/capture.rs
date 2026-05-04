@@ -75,6 +75,19 @@ pub fn capture_primary_monitor_sample(
     capture_monitor_sample(app_data_dir, None)
 }
 
+pub fn load_latest_capture_sample(
+    app_data_dir: impl AsRef<Path>,
+) -> Result<CaptureSampleReport, String> {
+    let samples_dir = capture_samples_dir(app_data_dir);
+    let json_path = latest_sample_json_path(&samples_dir)?.ok_or_else(|| {
+        format!(
+            "截图样本目录 {} 中没有历史截图，请先完成一次截图。",
+            samples_dir.display()
+        )
+    })?;
+    read_capture_sample_report(&json_path)
+}
+
 pub fn list_monitor_diagnostics() -> Result<Vec<MonitorDiagnostic>, String> {
     Monitor::all()
         .map_err(|error| format!("无法枚举显示器: {error}"))?
@@ -282,8 +295,24 @@ fn read_monitor_diagnostic(monitor: &Monitor) -> Result<MonitorDiagnostic, Strin
 }
 
 fn latest_frame_hash(samples_dir: &Path, monitor_id: u32) -> Result<Option<String>, String> {
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     let prefix = format!("monitor-{monitor_id}-");
+    let path = latest_sample_json_path_by(samples_dir, |file_name| file_name.starts_with(&prefix))?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let report = read_capture_sample_report(&path)?;
+    Ok(Some(report.image.frame_hash))
+}
+
+fn latest_sample_json_path(samples_dir: &Path) -> Result<Option<PathBuf>, String> {
+    latest_sample_json_path_by(samples_dir, |_| true)
+}
+
+fn latest_sample_json_path_by(
+    samples_dir: &Path,
+    matches: impl Fn(&str) -> bool,
+) -> Result<Option<PathBuf>, String> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
 
     for entry in fs::read_dir(samples_dir)
         .map_err(|error| format!("无法读取截图样本目录 {}: {error}", samples_dir.display()))?
@@ -296,7 +325,7 @@ fn latest_frame_hash(samples_dir: &Path, monitor_id: u32) -> Result<Option<Strin
         let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        if !file_name.starts_with(&prefix) {
+        if !matches(file_name) {
             continue;
         }
 
@@ -312,14 +341,15 @@ fn latest_frame_hash(samples_dir: &Path, monitor_id: u32) -> Result<Option<Strin
         }
     }
 
-    let Some((_, path)) = newest else {
-        return Ok(None);
-    };
+    Ok(newest.map(|(_, path)| path))
+}
+
+fn read_capture_sample_report(path: &Path) -> Result<CaptureSampleReport, String> {
     let content = fs::read_to_string(&path)
-        .map_err(|error| format!("无法读取旧截图诊断 JSON {}: {error}", path.display()))?;
+        .map_err(|error| format!("无法读取截图诊断 JSON {}: {error}", path.display()))?;
     let report: CaptureSampleReport = serde_json::from_str(&content)
-        .map_err(|error| format!("无法解析旧截图诊断 JSON {}: {error}", path.display()))?;
-    Ok(Some(report.image.frame_hash))
+        .map_err(|error| format!("无法解析截图诊断 JSON {}: {error}", path.display()))?;
+    Ok(report)
 }
 
 fn luma_from_rgb(red: u8, green: u8, blue: u8) -> u8 {
@@ -398,5 +428,121 @@ mod tests {
         assert!(is_black_screen(2.9, 0.0005));
         assert!(!is_black_screen(4.0, 0.0005));
         assert!(!is_black_screen(2.9, 0.01));
+    }
+
+    #[test]
+    fn loads_latest_capture_sample_from_samples_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "hex-assistant-capture-test-{}",
+            timestamp_for_filename()
+        ));
+        let samples_dir = capture_samples_dir(&root);
+        fs::create_dir_all(&samples_dir).expect("应能创建截图样本目录");
+
+        let older = CaptureSampleReport {
+            captured_at: "2026-05-01T00:00:00Z".to_string(),
+            monitor: MonitorDiagnostic {
+                id: 1,
+                name: "旧样本".to_string(),
+                friendly_name: "旧样本".to_string(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                rotation: 0.0,
+                scale_factor: 1.0,
+                frequency: 60.0,
+                primary: true,
+                builtin: false,
+            },
+            image: ImageDiagnostic {
+                width: 1920,
+                height: 1080,
+                capture_duration_ms: 10,
+                save_duration_ms: 5,
+                mean_luma: 10.0,
+                min_luma: 0,
+                max_luma: 255,
+                bright_pixel_ratio: 0.1,
+                black_screen: false,
+                frame_hash: "older".to_string(),
+            },
+            png_path: samples_dir.join("older.png"),
+            json_path: samples_dir.join("older.json"),
+            previous_frame_hash: None,
+            stale_frame: false,
+        };
+        let newer = CaptureSampleReport {
+            captured_at: "2026-05-02T00:00:00Z".to_string(),
+            monitor: MonitorDiagnostic {
+                id: 2,
+                name: "新样本".to_string(),
+                friendly_name: "新样本".to_string(),
+                x: 100,
+                y: 100,
+                width: 2560,
+                height: 1440,
+                rotation: 0.0,
+                scale_factor: 1.0,
+                frequency: 144.0,
+                primary: false,
+                builtin: false,
+            },
+            image: ImageDiagnostic {
+                width: 2560,
+                height: 1440,
+                capture_duration_ms: 20,
+                save_duration_ms: 8,
+                mean_luma: 20.0,
+                min_luma: 1,
+                max_luma: 254,
+                bright_pixel_ratio: 0.2,
+                black_screen: false,
+                frame_hash: "newer".to_string(),
+            },
+            png_path: samples_dir.join("newer.png"),
+            json_path: samples_dir.join("newer.json"),
+            previous_frame_hash: Some("older".to_string()),
+            stale_frame: false,
+        };
+
+        fs::write(
+            &older.json_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&older).expect("应能序列化旧样本")
+            ),
+        )
+        .expect("应能写入旧样本");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(
+            &newer.json_path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&newer).expect("应能序列化新样本")
+            ),
+        )
+        .expect("应能写入新样本");
+
+        let loaded = load_latest_capture_sample(&root).expect("应能读取最新截图样本");
+
+        assert_eq!(loaded, newer);
+
+        fs::remove_dir_all(&root).expect("应能清理测试目录");
+    }
+
+    #[test]
+    fn returns_clear_error_when_no_capture_sample_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "hex-assistant-empty-capture-test-{}",
+            timestamp_for_filename()
+        ));
+        fs::create_dir_all(capture_samples_dir(&root)).expect("应能创建空截图样本目录");
+
+        let error = load_latest_capture_sample(&root).expect_err("无样本时应返回错误");
+
+        assert!(error.contains("没有历史截图"));
+
+        fs::remove_dir_all(&root).expect("应能清理测试目录");
     }
 }
