@@ -25,6 +25,8 @@ use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
+use std::path::PathBuf;
+#[cfg(not(test))]
 use std::time::Instant;
 use tauri::{AppHandle, State};
 
@@ -233,39 +235,19 @@ pub async fn run_calibrated_name_ocr(
     );
     let resource_root = resource_paths::resource_root(&app);
     let paths_for_task = paths.clone();
+    let trace_id_for_task = trace_id.clone();
     let start = Instant::now();
     let join_result = tauri::async_runtime::spawn_blocking(move || {
-        let resource_status = ocr::check_ppocr_resources(&resource_root);
-        if !resource_status.ready {
-            return Err(resource_status.message);
-        }
-
-        let dictionary_path = resource_root
-            .join("dictionaries")
-            .join(AUGMENT_DICTIONARY_ZH_CN);
-        let dictionary =
-            ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
-        let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
-            .map_err(|error| error.to_string())?;
-        let screenshot_path = match screenshot_path {
-            Some(path) => path,
-            None => {
-                let capture_report =
-                    capture::capture_monitor_sample(&paths_for_task.root, preferred_monitor_id)?;
-                capture_report.png_path
-            }
-        };
-
-        ocr::recognize_calibrated_name_slots_from_image(
-            &mut recognizer,
-            &dictionary,
-            &calibration,
-            &screenshot_path,
-            &paths_for_task.reports,
+        run_calibrated_ocr_task(
+            &paths_for_task,
+            &trace_id_for_task,
+            resource_root,
+            calibration,
+            screenshot_path,
+            preferred_monitor_id,
             settings.ocr.min_confidence,
             settings.ocr.min_match_score,
         )
-        .map_err(|error| error.to_string())
     })
     .await;
 
@@ -315,31 +297,19 @@ pub async fn run_pixel_calibrated_name_ocr(
     );
     let resource_root = resource_paths::resource_root(&app);
     let paths_for_task = paths.clone();
+    let trace_id_for_task = trace_id.clone();
     let start = Instant::now();
     let join_result = tauri::async_runtime::spawn_blocking(move || {
-        let resource_status = ocr::check_ppocr_resources(&resource_root);
-        if !resource_status.ready {
-            return Err(resource_status.message);
-        }
-
-        let dictionary_path = resource_root
-            .join("dictionaries")
-            .join(AUGMENT_DICTIONARY_ZH_CN);
-        let dictionary =
-            ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
-        let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&resource_root)
-            .map_err(|error| error.to_string())?;
-
-        ocr::recognize_calibrated_name_slots_from_image(
-            &mut recognizer,
-            &dictionary,
-            &calibration,
-            &screenshot_path,
-            &paths_for_task.reports,
+        run_calibrated_ocr_task(
+            &paths_for_task,
+            &trace_id_for_task,
+            resource_root,
+            calibration,
+            Some(screenshot_path),
+            None,
             settings.ocr.min_confidence,
             settings.ocr.min_match_score,
         )
-        .map_err(|error| error.to_string())
     })
     .await;
 
@@ -350,6 +320,136 @@ pub async fn run_pixel_calibrated_name_ocr(
         start,
         join_result,
     )
+}
+
+#[cfg(not(test))]
+fn run_calibrated_ocr_task(
+    paths: &AppPaths,
+    trace_id: &str,
+    resource_root: PathBuf,
+    calibration: CalibrationConfig,
+    screenshot_path: Option<PathBuf>,
+    preferred_monitor_id: Option<u32>,
+    min_confidence: f32,
+    min_match_score: f32,
+) -> Result<CalibratedNameOcrReport, String> {
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-resource-check-start",
+        format!("开始检查 OCR 资源 root={}", resource_root.display()),
+        "准备校验资源目录并按需镜像网络路径资源".to_string(),
+    );
+    let prepared = resource_paths::prepare_runtime_resource_root(&resource_root, &paths.cache)?;
+    let resource_status = ocr::check_ppocr_resources(&prepared.runtime_root);
+    if !resource_status.ready {
+        return Err(resource_status.message);
+    }
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-resource-check-success",
+        format!(
+            "OCR 资源检查完成 source={} runtime={} mirrored={} cache_hit={}",
+            prepared.source_root.display(),
+            prepared.runtime_root.display(),
+            prepared.mirrored_from_network,
+            prepared.cache_hit
+        ),
+        resource_status.message.clone(),
+    );
+
+    let dictionary_path = prepared
+        .runtime_root
+        .join("dictionaries")
+        .join(AUGMENT_DICTIONARY_ZH_CN);
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-dictionary-load-start",
+        format!("开始加载 OCR 词库 path={}", dictionary_path.display()),
+        "准备读取海克斯词库".to_string(),
+    );
+    let dictionary =
+        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-dictionary-load-success",
+        format!("OCR 词库加载完成 path={}", dictionary_path.display()),
+        "海克斯词库加载成功".to_string(),
+    );
+
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-recognizer-init-start",
+        format!(
+            "开始初始化 OCR 识别器 resource_root={}",
+            prepared.runtime_root.display()
+        ),
+        "准备创建 ORT 会话并加载模型".to_string(),
+    );
+    let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&prepared.runtime_root)
+        .map_err(|error| error.to_string())?;
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-recognizer-init-success",
+        format!(
+            "OCR 识别器初始化完成 model={}",
+            recognizer.model_path().display()
+        ),
+        "模型、字符表与 ORT 会话已就绪".to_string(),
+    );
+
+    let screenshot_path = match screenshot_path {
+        Some(path) => path,
+        None => {
+            let capture_report =
+                capture::capture_monitor_sample(&paths.root, preferred_monitor_id)?;
+            capture_report.png_path
+        }
+    };
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-inference-start",
+        format!(
+            "开始执行 OCR 推理 screenshot={} report_dir={}",
+            screenshot_path.display(),
+            paths.reports.display()
+        ),
+        "准备裁剪校准区域并执行 OCR 推理".to_string(),
+    );
+    let inference_start = Instant::now();
+    let report = ocr::recognize_calibrated_name_slots_from_image(
+        &mut recognizer,
+        &dictionary,
+        &calibration,
+        &screenshot_path,
+        &paths.reports,
+        min_confidence,
+        min_match_score,
+    )
+    .map_err(|error| error.to_string())?;
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-inference-finish",
+        format!(
+            "OCR 推理完成 screenshot={} report={}",
+            screenshot_path.display(),
+            report.report_path.display()
+        ),
+        format!(
+            "识别完成 slot_count={} inference_ms={}",
+            report.slot_count,
+            inference_start.elapsed().as_millis()
+        ),
+    );
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -533,6 +633,26 @@ fn finalize_ocr_telemetry(
             Err(message)
         }
     }
+}
+
+#[cfg(not(test))]
+fn log_ocr_stage(
+    paths: &AppPaths,
+    trace_id: &str,
+    stage: &str,
+    input_summary: String,
+    message: String,
+) {
+    write_ocr_telemetry(
+        paths,
+        trace_id,
+        "info",
+        None,
+        stage,
+        input_summary,
+        message,
+        0,
+    );
 }
 
 #[cfg(not(test))]
