@@ -23,6 +23,8 @@ use crate::{app_paths::AppPaths, telemetry};
 use base64::{engine::general_purpose, Engine};
 #[cfg(not(test))]
 use chrono::Utc;
+#[cfg(not(test))]
+use ort::init_from as init_ort_from;
 use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 use std::path::PathBuf;
@@ -390,6 +392,31 @@ fn run_calibrated_ocr_task(
     log_ocr_stage(
         paths,
         trace_id,
+        "ocr-ort-init-start",
+        format!(
+            "开始初始化 ONNX Runtime 动态库 root={}",
+            prepared.runtime_root.display()
+        ),
+        "准备显式加载 onnxruntime 动态库".to_string(),
+    );
+    let ort_dylib_path = ort_dylib_path(&prepared.runtime_root);
+    init_ort_from(&ort_dylib_path)
+        .map_err(|error| format!("无法加载 ONNX Runtime 动态库 {}: {error}", ort_dylib_path.display()))?
+        .commit();
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-ort-init-success",
+        format!(
+            "ONNX Runtime 动态库初始化完成 path={}",
+            ort_dylib_path.display()
+        ),
+        "onnxruntime 动态库已显式加载".to_string(),
+    );
+
+    log_ocr_stage(
+        paths,
+        trace_id,
         "ocr-recognizer-init-start",
         format!(
             "开始初始化 OCR 识别器 resource_root={}",
@@ -686,4 +713,16 @@ fn write_ocr_telemetry(
     };
 
     let _ = telemetry::append_event(paths, &event);
+}
+
+#[cfg(not(test))]
+fn ort_dylib_path(resource_root: &std::path::Path) -> PathBuf {
+    let file_name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    resource_root.join("onnxruntime").join(file_name)
 }
