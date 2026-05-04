@@ -734,6 +734,11 @@ function ScreenshotPreview({
   const width = capture?.image.width ?? 16;
   const height = capture?.image.height ?? 9;
   const activeDefinition = regionDefinitions.find((definition) => definition.key === activeRegion)!;
+  const [zoom, setZoom] = useState(1);
+
+  useEffect(() => {
+    setZoom(1);
+  }, [screenshot?.path]);
 
   function pointerToPixel(event: React.PointerEvent<HTMLDivElement>) {
     const bounds = ref.current?.getBoundingClientRect();
@@ -793,41 +798,60 @@ function ScreenshotPreview({
         <span>{capture ? `截图尺寸：${capture.image.width} x ${capture.image.height}` : "等待截图"}</span>
         <span>{capture ? `截图时间：${capture.capturedAt}` : "按向导完成自定义游戏画面后截图"}</span>
       </div>
-      <div
-        ref={ref}
-        className="screenshot-preview"
-        style={{ aspectRatio: `${width} / ${height}` }}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={() => setDrag(null)}
-      >
-        {screenshot ? (
-          <img src={screenshot.dataUrl} alt="校准截图" draggable={false} />
-        ) : (
-          <div className="preview-placeholder">
-            <strong>等待截图</strong>
-            <span>截图后会在这里显示游戏画面。</span>
-          </div>
-        )}
-        {visibleRects.map((item) => (
-          <div
-            key={item.key}
-            className={`region-box ${item.key === activeRegion ? "active" : ""}`}
-            style={rectToPercentStyle(item.rect, width, height)}
-          >
-            <span>{item.label}</span>
-          </div>
-        ))}
-        {visiblePoints.map((item) => (
-          <div
-            key={item.key}
-            className={`point-marker ${item.key === activeRegion ? "active" : ""}`}
-            style={pointToPercentStyle(item.point, width, height)}
-          >
-            <span>{item.label}</span>
-          </div>
-        ))}
+      <div className="preview-toolbar">
+        <span>预览缩放 {Math.round(zoom * 100)}%</span>
+        <div className="button-row">
+          <button type="button" onClick={() => setZoom((current) => clamp(Number((current - 0.25).toFixed(2)), 0.5, 3))}>
+            缩小
+          </button>
+          <button type="button" onClick={() => setZoom(1)}>
+            还原
+          </button>
+          <button type="button" onClick={() => setZoom((current) => clamp(Number((current + 0.25).toFixed(2)), 0.5, 3))}>
+            放大
+          </button>
+        </div>
+      </div>
+      <div className="preview-viewport">
+        <div
+          ref={ref}
+          className="screenshot-preview"
+          style={{
+            width: `${Math.max(1, Math.round(width * zoom))}px`,
+            height: `${Math.max(1, Math.round(height * zoom))}px`,
+          }}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          onPointerCancel={() => setDrag(null)}
+        >
+          {screenshot ? (
+            <img src={screenshot.dataUrl} alt="校准截图" draggable={false} />
+          ) : (
+            <div className="preview-placeholder">
+              <strong>等待截图</strong>
+              <span>截图后会在这里显示游戏画面。</span>
+            </div>
+          )}
+          {visibleRects.map((item) => (
+            <div
+              key={item.key}
+              className={`region-box ${item.key === activeRegion ? "active" : ""}`}
+              style={rectToPercentStyle(item.rect, width, height)}
+            >
+              <span>{item.label}</span>
+            </div>
+          ))}
+          {visiblePoints.map((item) => (
+            <div
+              key={item.key}
+              className={`point-marker ${item.key === activeRegion ? "active" : ""}`}
+              style={pointToPercentStyle(item.point, width, height)}
+            >
+              <span>{item.label}</span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );

@@ -249,6 +249,36 @@ h2 {
   overflow-wrap: anywhere;
 }
 
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: #536276;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.preview-toolbar .button-row {
+  gap: 8px;
+}
+
+.preview-toolbar button {
+  min-height: 34px;
+}
+
+.preview-viewport {
+  width: 100%;
+  min-height: 360px;
+  max-height: 72vh;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid #d6dfe8;
+  border-radius: 8px;
+  background: #f7fafc;
+}
+
 .screenshot-preview {
   position: relative;
   width: 100%;
@@ -565,5 +595,11 @@ html.overlay-document #root {
   .button-row,
   .final-row {
     justify-content: flex-start;
+  }
+
+  .preview-toolbar {
+    display: grid;
+    align-items: flex-start;
+    gap: 8px;
   }
 }
