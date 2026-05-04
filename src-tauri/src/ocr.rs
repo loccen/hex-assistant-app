@@ -9,7 +9,7 @@ use crate::calibration::{denormalize_rect, CalibrationConfig, PixelRect, Screens
 #[cfg(test)]
 use calibration::{denormalize_rect, CalibrationConfig, PixelRect, ScreenshotSize};
 use chrono::Utc;
-use image::{imageops, DynamicImage, ImageBuffer, Rgb, RgbImage};
+use image::{imageops, DynamicImage, GrayImage, ImageBuffer, Rgb, RgbImage};
 use ndarray::{Array4, Axis};
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
@@ -644,7 +644,10 @@ pub struct CalibratedNameOcrSlotReport {
     pub slot: CalibratedNameSlot,
     pub crop_rect: PixelRectReport,
     pub crop_path: PathBuf,
+    pub refined_crop_rect: PixelRectReport,
+    pub refined_crop_path: PathBuf,
     pub enhanced_path: PathBuf,
+    pub preview_path: PathBuf,
     pub raw_text: String,
     pub confidence: f32,
     pub match_score: f32,
@@ -750,9 +753,20 @@ pub fn recognize_calibrated_name_slots_from_image(
             )
         })?;
         let crop = image.crop_imm(rect.x, rect.y, rect.width, rect.height);
-        let enhanced = enhance_name_crop(&crop);
+        let refined_local_rect = auto_crop_title_band(&crop);
+        let refined_rect = translate_local_rect(rect, refined_local_rect);
+        let refined_crop = crop.crop_imm(
+            refined_local_rect.x,
+            refined_local_rect.y,
+            refined_local_rect.width,
+            refined_local_rect.height,
+        );
+        let preview = annotate_crop_rect(&crop, refined_local_rect);
+        let enhanced = enhance_name_crop(&refined_crop);
         let crop_path = output_dir.join(format!("slot-{}-crop.png", slot.as_str()));
+        let refined_crop_path = output_dir.join(format!("slot-{}-refined-crop.png", slot.as_str()));
         let enhanced_path = output_dir.join(format!("slot-{}-enhanced.png", slot.as_str()));
+        let preview_path = output_dir.join(format!("slot-{}-preview.png", slot.as_str()));
         crop.save(&crop_path).map_err(|error| {
             OcrError::new(
                 OcrErrorCode::Io,
@@ -760,11 +774,25 @@ pub fn recognize_calibrated_name_slots_from_image(
                 Some(crop_path.clone()),
             )
         })?;
+        refined_crop.save(&refined_crop_path).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法写入 slot 精裁图: {error}"),
+                Some(refined_crop_path.clone()),
+            )
+        })?;
         enhanced.save(&enhanced_path).map_err(|error| {
             OcrError::new(
                 OcrErrorCode::Io,
                 format!("无法写入 slot 增强图: {error}"),
                 Some(enhanced_path.clone()),
+            )
+        })?;
+        preview.save(&preview_path).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法写入 slot 预览图: {error}"),
+                Some(preview_path.clone()),
             )
         })?;
 
@@ -789,7 +817,10 @@ pub fn recognize_calibrated_name_slots_from_image(
             slot,
             crop_rect: rect.into(),
             crop_path,
+            refined_crop_rect: refined_rect.into(),
+            refined_crop_path,
             enhanced_path,
+            preview_path,
             raw_text: matched.raw_text,
             confidence: matched.confidence,
             match_score: matched.match_score,
@@ -944,6 +975,349 @@ fn clamp_pixel_rect(rect: PixelRect, image_width: u32, image_height: u32) -> Opt
         width,
         height,
     })
+}
+
+fn auto_crop_title_band(crop: &DynamicImage) -> PixelRect {
+    if crop.width() < 4 || crop.height() < 4 {
+        return PixelRect {
+            x: 0,
+            y: 0,
+            width: crop.width().max(1),
+            height: crop.height().max(1),
+        };
+    }
+
+    let stretched = stretch_gray_image(&crop.to_luma8());
+    let threshold = otsu_threshold(&stretched).max(160);
+    let row_counts = foreground_projection_rows(&stretched, threshold);
+    let smoothed_rows = smooth_projection(&row_counts, 2);
+    let row_threshold = row_activity_threshold(&smoothed_rows, crop.width(), 0.04);
+    let row_bands = collect_active_bands(&smoothed_rows, row_threshold, crop.height() / 10 + 1);
+
+    let Some((best_index, best_band)) = pick_best_band(&row_bands, crop.height()) else {
+        return PixelRect {
+            x: 0,
+            y: 0,
+            width: crop.width(),
+            height: crop.height(),
+        };
+    };
+    let best_band = extend_title_band(best_index, best_band, &row_bands, crop.height());
+
+    let column_counts =
+        foreground_projection_columns(&stretched, threshold, best_band.start, best_band.end);
+    let smoothed_columns = smooth_projection(&column_counts, 2);
+    let column_threshold = column_activity_threshold(&smoothed_columns, best_band.height(), 0.08);
+    let Some((left, right)) = find_projection_span(&smoothed_columns, column_threshold) else {
+        return PixelRect {
+            x: 0,
+            y: 0,
+            width: crop.width(),
+            height: crop.height(),
+        };
+    };
+
+    let margin_x = (crop.width() / 40).max(2);
+    let margin_y = (crop.height() / 40).max(2);
+    let x = left.saturating_sub(margin_x);
+    let y = best_band.start.saturating_sub(margin_y);
+    let right = (right + margin_x).min(crop.width().saturating_sub(1));
+    let bottom = (best_band.end + margin_y).min(crop.height().saturating_sub(1));
+    let refined = PixelRect {
+        x,
+        y,
+        width: right.saturating_sub(x).saturating_add(1),
+        height: bottom.saturating_sub(y).saturating_add(1),
+    };
+
+    if refined.width < (crop.width() / 5).max(8) || refined.height < (crop.height() / 8).max(6) {
+        PixelRect {
+            x: 0,
+            y: 0,
+            width: crop.width(),
+            height: crop.height(),
+        }
+    } else {
+        refined
+    }
+}
+
+fn stretch_gray_image(gray: &GrayImage) -> GrayImage {
+    let mut min_luma = u8::MAX;
+    let mut max_luma = u8::MIN;
+    for pixel in gray.pixels() {
+        min_luma = min_luma.min(pixel[0]);
+        max_luma = max_luma.max(pixel[0]);
+    }
+
+    let range = u16::from(max_luma.saturating_sub(min_luma)).max(1);
+    ImageBuffer::from_fn(gray.width(), gray.height(), |x, y| {
+        let shifted = gray.get_pixel(x, y)[0].saturating_sub(min_luma);
+        image::Luma([((u16::from(shifted) * 255) / range).min(255) as u8])
+    })
+}
+
+fn otsu_threshold(gray: &GrayImage) -> u8 {
+    let mut histogram = [0u32; 256];
+    for pixel in gray.pixels() {
+        histogram[pixel[0] as usize] += 1;
+    }
+
+    let total = (gray.width() * gray.height()) as f64;
+    if total <= 0.0 {
+        return 0;
+    }
+
+    let mut sum = 0.0;
+    for (index, count) in histogram.iter().enumerate() {
+        sum += index as f64 * f64::from(*count);
+    }
+
+    let mut background_sum = 0.0;
+    let mut background_weight = 0.0;
+    let mut best_threshold = 0u8;
+    let mut best_variance = -1.0f64;
+
+    for (index, count) in histogram.iter().enumerate() {
+        background_weight += f64::from(*count);
+        if background_weight <= 0.0 {
+            continue;
+        }
+
+        let foreground_weight = total - background_weight;
+        if foreground_weight <= 0.0 {
+            break;
+        }
+
+        background_sum += index as f64 * f64::from(*count);
+        let background_mean = background_sum / background_weight;
+        let foreground_mean = (sum - background_sum) / foreground_weight;
+        let variance = background_weight
+            * foreground_weight
+            * (background_mean - foreground_mean)
+            * (background_mean - foreground_mean);
+        if variance > best_variance {
+            best_variance = variance;
+            best_threshold = index as u8;
+        }
+    }
+
+    best_threshold
+}
+
+fn foreground_projection_rows(gray: &GrayImage, threshold: u8) -> Vec<u32> {
+    (0..gray.height())
+        .map(|y| {
+            (0..gray.width())
+                .filter(|x| gray.get_pixel(*x, y)[0] >= threshold)
+                .count() as u32
+        })
+        .collect()
+}
+
+fn foreground_projection_columns(
+    gray: &GrayImage,
+    threshold: u8,
+    top: u32,
+    bottom: u32,
+) -> Vec<u32> {
+    (0..gray.width())
+        .map(|x| {
+            (top..=bottom)
+                .filter(|y| gray.get_pixel(x, *y)[0] >= threshold)
+                .count() as u32
+        })
+        .collect()
+}
+
+fn smooth_projection(values: &[u32], radius: usize) -> Vec<u32> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+
+    (0..values.len())
+        .map(|index| {
+            let start = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(values.len());
+            let sum: u32 = values[start..end].iter().sum();
+            (sum as f32 / (end - start) as f32).round() as u32
+        })
+        .collect()
+}
+
+fn row_activity_threshold(rows: &[u32], width: u32, min_ratio: f32) -> u32 {
+    let max_value = rows.iter().copied().max().unwrap_or(0);
+    let ratio_floor = (width as f32 * min_ratio).round() as u32;
+    ((max_value as f32 * 0.3).round() as u32)
+        .max(ratio_floor)
+        .max(3)
+}
+
+fn column_activity_threshold(columns: &[u32], band_height: u32, min_ratio: f32) -> u32 {
+    let max_value = columns.iter().copied().max().unwrap_or(0);
+    let ratio_floor = (band_height as f32 * min_ratio).round() as u32;
+    ((max_value as f32 * 0.25).round() as u32)
+        .max(ratio_floor)
+        .max(2)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectionBand {
+    start: u32,
+    end: u32,
+    peak: u32,
+    area: u32,
+}
+
+impl ProjectionBand {
+    fn height(self) -> u32 {
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+}
+
+fn collect_active_bands(values: &[u32], threshold: u32, max_gap: u32) -> Vec<ProjectionBand> {
+    let mut bands = Vec::new();
+    let mut start = None;
+    let mut last_active = 0usize;
+    let mut peak = 0u32;
+    let mut area = 0u32;
+
+    for (index, value) in values.iter().copied().enumerate() {
+        if value >= threshold {
+            if start.is_none() {
+                start = Some(index);
+                peak = value;
+                area = value;
+            } else {
+                peak = peak.max(value);
+                area = area.saturating_add(value);
+            }
+            last_active = index;
+            continue;
+        }
+
+        if let Some(start_index) = start {
+            if (index - last_active) as u32 <= max_gap {
+                area = area.saturating_add(value);
+                continue;
+            }
+
+            bands.push(ProjectionBand {
+                start: start_index as u32,
+                end: last_active as u32,
+                peak,
+                area,
+            });
+            start = None;
+            peak = 0;
+            area = 0;
+        }
+    }
+
+    if let Some(start_index) = start {
+        bands.push(ProjectionBand {
+            start: start_index as u32,
+            end: last_active as u32,
+            peak,
+            area,
+        });
+    }
+
+    bands
+}
+
+fn pick_best_band(bands: &[ProjectionBand], crop_height: u32) -> Option<(usize, ProjectionBand)> {
+    let max_area = bands.iter().map(|band| band.area).max()? as f32;
+    let max_peak = bands.iter().map(|band| band.peak).max().unwrap_or(1) as f32;
+    bands
+        .iter()
+        .enumerate()
+        .map(|(index, band)| (index, *band))
+        .filter(|(_, band)| band.start < crop_height.saturating_sub(1))
+        .filter(|(_, band)| band.start < crop_height.saturating_mul(17) / 20)
+        .max_by(|(_, left), (_, right)| {
+            let left_score = band_score(*left, crop_height, max_area, max_peak);
+            let right_score = band_score(*right, crop_height, max_area, max_peak);
+            left_score.total_cmp(&right_score)
+        })
+}
+
+fn extend_title_band(
+    best_index: usize,
+    best_band: ProjectionBand,
+    row_bands: &[ProjectionBand],
+    crop_height: u32,
+) -> ProjectionBand {
+    let Some(next_band) = row_bands.get(best_index + 1).copied() else {
+        return best_band;
+    };
+    let gap = next_band.start.saturating_sub(best_band.end);
+    let close_enough = gap <= (crop_height / 10).max(4);
+    let similar_peak = next_band.peak * 10 >= best_band.peak * 4;
+    let similar_area = next_band.area * 10 >= best_band.area * 4;
+    if close_enough && (similar_peak || similar_area) {
+        ProjectionBand {
+            start: best_band.start,
+            end: next_band.end,
+            peak: best_band.peak.max(next_band.peak),
+            area: best_band.area.saturating_add(next_band.area),
+        }
+    } else {
+        best_band
+    }
+}
+
+fn band_score(band: ProjectionBand, crop_height: u32, max_area: f32, max_peak: f32) -> f32 {
+    let top_bias = 1.0 - band.start as f32 / crop_height.max(1) as f32;
+    let area_ratio = band.area as f32 / max_area.max(1.0);
+    let peak_ratio = band.peak as f32 / max_peak.max(1.0);
+    let height_ratio = band.height() as f32 / crop_height.max(1) as f32;
+    area_ratio * 0.45 + peak_ratio * 0.2 + height_ratio * 0.1 + top_bias * 0.35
+}
+
+fn find_projection_span(values: &[u32], threshold: u32) -> Option<(u32, u32)> {
+    let left = values.iter().position(|value| *value >= threshold)? as u32;
+    let right = values.iter().rposition(|value| *value >= threshold)? as u32;
+    Some((left, right))
+}
+
+fn translate_local_rect(base: PixelRect, local: PixelRect) -> PixelRect {
+    PixelRect {
+        x: base.x.saturating_add(local.x),
+        y: base.y.saturating_add(local.y),
+        width: local.width,
+        height: local.height,
+    }
+}
+
+fn annotate_crop_rect(crop: &DynamicImage, rect: PixelRect) -> DynamicImage {
+    let mut preview = crop.to_rgb8();
+    if preview.width() == 0 || preview.height() == 0 {
+        return DynamicImage::ImageRgb8(preview);
+    }
+
+    let left = rect.x.min(preview.width().saturating_sub(1));
+    let top = rect.y.min(preview.height().saturating_sub(1));
+    let right = rect
+        .x
+        .saturating_add(rect.width.saturating_sub(1))
+        .min(preview.width().saturating_sub(1));
+    let bottom = rect
+        .y
+        .saturating_add(rect.height.saturating_sub(1))
+        .min(preview.height().saturating_sub(1));
+    let border = Rgb([255, 64, 64]);
+
+    for x in left..=right {
+        preview.put_pixel(x, top, border);
+        preview.put_pixel(x, bottom, border);
+    }
+    for y in top..=bottom {
+        preview.put_pixel(left, y, border);
+        preview.put_pixel(right, y, border);
+    }
+
+    DynamicImage::ImageRgb8(preview)
 }
 
 fn enhance_name_crop(crop: &DynamicImage) -> DynamicImage {
@@ -1184,6 +1558,28 @@ mod tests {
                 height: 5
             }
         );
+    }
+
+    #[test]
+    fn auto_crop_title_band_prefers_upper_title_and_filters_lower_label() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(140, 90, |x, y| {
+            let top_title = (18..=26).contains(&y) && (20..=118).contains(&x);
+            let second_title = (34..=42).contains(&y) && (30..=110).contains(&x);
+            let lower_label = (62..=66).contains(&y) && (48..=90).contains(&x);
+            if top_title || second_title || lower_label {
+                Rgb([245, 245, 245])
+            } else {
+                Rgb([18, 18, 18])
+            }
+        }));
+
+        let rect = auto_crop_title_band(&image);
+
+        assert!(rect.y <= 18, "精裁应覆盖主标题上边缘");
+        assert!(rect.y + rect.height >= 42, "精裁应保留双行标题下边缘");
+        assert!(rect.y + rect.height < 62, "精裁应排除下方小标签");
+        assert!(rect.x <= 20, "精裁应覆盖标题左边缘");
+        assert!(rect.x + rect.width >= 110, "精裁应覆盖标题右边缘");
     }
 
     #[test]
