@@ -1017,11 +1017,14 @@ fn auto_crop_title_band(crop: &DynamicImage) -> PixelRect {
         };
     };
 
+    // 首字偏细时，投影起点容易落在笔画内部，因此左侧留白要比右侧更宽。
     let margin_x = (crop.width() / 40).max(2);
+    let left_margin_x = margin_x.max(crop.width() / 20).max(8);
+    let right_margin_x = margin_x.max(crop.width() / 30).max(4);
     let margin_y = (crop.height() / 40).max(2);
-    let x = left.saturating_sub(margin_x);
+    let x = left.saturating_sub(left_margin_x);
     let y = best_band.start.saturating_sub(margin_y);
-    let right = (right + margin_x).min(crop.width().saturating_sub(1));
+    let right = (right + right_margin_x).min(crop.width().saturating_sub(1));
     let bottom = (best_band.end + margin_y).min(crop.height().saturating_sub(1));
     let refined = PixelRect {
         x,
@@ -1580,6 +1583,24 @@ mod tests {
         assert!(rect.y + rect.height < 62, "精裁应排除下方小标签");
         assert!(rect.x <= 20, "精裁应覆盖标题左边缘");
         assert!(rect.x + rect.width >= 110, "精裁应覆盖标题右边缘");
+    }
+
+    #[test]
+    fn auto_crop_title_band_keeps_extra_left_padding_for_thin_first_character() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_fn(160, 90, |x, y| {
+            let thin_first_character = (20..=40).contains(&y) && (18..=20).contains(&x);
+            let main_title = (20..=40).contains(&y) && (34..=118).contains(&x);
+            if thin_first_character || main_title {
+                Rgb([245, 245, 245])
+            } else {
+                Rgb([18, 18, 18])
+            }
+        }));
+
+        let rect = auto_crop_title_band(&image);
+
+        assert!(rect.x <= 10, "精裁应为细窄首字预留更宽左边界");
+        assert!(rect.x + rect.width >= 118, "精裁应保留标题主体右边缘");
     }
 
     #[test]
