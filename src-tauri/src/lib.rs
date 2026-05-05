@@ -66,6 +66,7 @@ pub fn run() {
             commands::run_ocr_text_replay,
             commands::run_calibrated_name_ocr,
             commands::run_pixel_calibrated_name_ocr,
+            commands::fetch_live_client_resolved_player_snapshot,
             commands::fetch_live_client_active_player,
             commands::evaluate_state_machine,
             commands::get_runtime_orchestrator_status,
