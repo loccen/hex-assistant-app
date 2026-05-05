@@ -2,6 +2,7 @@ use crate::app_paths::AppPaths;
 use crate::live_client::{LiveClientDataApi, LiveClientError, ResolvedPlayerSnapshot};
 use crate::models::TelemetryEventInput;
 use crate::overlay::{self, OverlaySlotData, RuntimeOverlaySyncReport};
+use crate::runtime_panel;
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{
     AssistantState, AssistantStateMachine, AugmentChoice, LivePlayerSnapshot, PanelState,
@@ -142,7 +143,8 @@ impl RuntimeOrchestratorHandle {
             .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
         orchestrator.apply_panel_snapshot(request.panel_snapshot);
         let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
-        let overlay_plan = orchestrator.tick(&paths, RuntimeTriggerEvent::Manual, live_result)?;
+        let overlay_plan =
+            orchestrator.tick(Some(app), &paths, RuntimeTriggerEvent::Manual, live_result)?;
         orchestrator.sync_overlay(app, &paths, RuntimeTriggerEvent::Manual, &overlay_plan);
         Ok(orchestrator.snapshot(self.listening.load(Ordering::SeqCst)))
     }
@@ -182,6 +184,7 @@ impl RuntimeOrchestratorHandle {
                 let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
                 if let Ok(mut orchestrator) = inner.lock() {
                     if let Ok(overlay_plan) = orchestrator.tick(
+                        Some(&worker_app),
                         &worker_paths,
                         RuntimeTriggerEvent::LowFrequencyPoll,
                         live_result,
@@ -287,6 +290,7 @@ impl RuntimeOrchestrator {
 
     fn tick(
         &mut self,
+        app: Option<&AppHandle>,
         paths: &AppPaths,
         trigger_event: RuntimeTriggerEvent,
         live_result: Result<ResolvedPlayerSnapshot, LiveClientError>,
@@ -367,6 +371,9 @@ impl RuntimeOrchestrator {
                 Some(error.diagnostic_payload()),
             ),
         };
+        if let Some(app) = app {
+            self.refresh_panel_snapshot(app, paths, player.as_ref(), trigger_event);
+        }
         let pending_tiers_before_apply = self.machine.state().pending_tiers.clone();
         self.record_state_machine_input(
             paths,
@@ -412,6 +419,51 @@ impl RuntimeOrchestrator {
             start.elapsed().as_millis(),
         )?;
         Ok(overlay_plan)
+    }
+
+    fn refresh_panel_snapshot(
+        &mut self,
+        app: &AppHandle,
+        paths: &AppPaths,
+        player: Option<&LivePlayerSnapshot>,
+        trigger_event: RuntimeTriggerEvent,
+    ) {
+        let should_detect = player.is_some_and(|current| current.level >= 3);
+        if !should_detect {
+            if self.panel_snapshot.panel_state != PanelState::Collapsed
+                || !self.panel_snapshot.choices.is_empty()
+            {
+                self.panel_snapshot = CalibratedPanelSnapshot::default();
+            }
+            return;
+        }
+
+        let settings = match load_or_create_settings(paths) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.log_panel_snapshot_refresh(
+                    paths,
+                    trigger_event,
+                    None,
+                    Some(format!("读取设置失败: {error}")),
+                );
+                return;
+            }
+        };
+        match runtime_panel::detect_runtime_panel_snapshot(app, paths, &settings) {
+            Ok(snapshot) => {
+                let report = snapshot.report.clone();
+                self.panel_snapshot = CalibratedPanelSnapshot {
+                    panel_state: snapshot.panel_state,
+                    choices: snapshot.choices,
+                    selected_slot: None,
+                };
+                self.log_panel_snapshot_refresh(paths, trigger_event, Some(report), None);
+            }
+            Err(error) => {
+                self.log_panel_snapshot_refresh(paths, trigger_event, None, Some(error));
+            }
+        }
     }
 
     fn record_state_machine_input(
@@ -609,6 +661,44 @@ impl RuntimeOrchestrator {
         }
     }
 
+    fn log_panel_snapshot_refresh(
+        &self,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+        report: Option<runtime_panel::RuntimePanelSnapshotReport>,
+        error_message: Option<String>,
+    ) {
+        let payload = json!({
+            "triggerEvent": trigger_event,
+            "panelSnapshot": self.panel_snapshot,
+            "report": report,
+            "errorMessage": error_message,
+        });
+        let kind = if payload["report"].is_null() {
+            "panel-snapshot-refresh-failed"
+        } else {
+            "panel-snapshot-refresh-applied"
+        };
+        let output_summary = if payload["report"].is_null() {
+            "运行时面板快照刷新失败"
+        } else {
+            "运行时面板快照刷新完成"
+        };
+        let level = if error_message.is_some() {
+            "warn"
+        } else {
+            "info"
+        };
+        let error_code = error_message
+            .as_ref()
+            .map(|_| "HEX-RUNTIME-PANEL-SNAPSHOT-FAILED".to_string());
+        if let Err(log_error) =
+            self.write_runtime_log(paths, kind, output_summary, level, error_code, &payload)
+        {
+            eprintln!("写入运行时面板快照日志失败: {log_error}");
+        }
+    }
+
     fn sync_overlay(
         &self,
         app: &AppHandle,
@@ -624,13 +714,9 @@ impl RuntimeOrchestrator {
         };
 
         match result {
-            Ok(report) => self.log_overlay_sync_result(
-                paths,
-                trigger_event,
-                overlay_plan,
-                &report,
-                None,
-            ),
+            Ok(report) => {
+                self.log_overlay_sync_result(paths, trigger_event, overlay_plan, &report, None)
+            }
             Err(error) => self.log_overlay_sync_result(
                 paths,
                 trigger_event,
@@ -638,8 +724,12 @@ impl RuntimeOrchestrator {
                 &RuntimeOverlaySyncReport {
                     label: "hex-assistant-overlay".to_string(),
                     action: match overlay_plan {
-                        RuntimeOverlayPlan::Show { .. } => overlay::RuntimeOverlaySyncAction::Created,
-                        RuntimeOverlayPlan::Hide { .. } => overlay::RuntimeOverlaySyncAction::Hidden,
+                        RuntimeOverlayPlan::Show { .. } => {
+                            overlay::RuntimeOverlaySyncAction::Created
+                        }
+                        RuntimeOverlayPlan::Hide { .. } => {
+                            overlay::RuntimeOverlaySyncAction::Hidden
+                        }
                     },
                     visible: matches!(overlay_plan, RuntimeOverlayPlan::Show { .. }),
                     window_exists: false,
@@ -685,7 +775,11 @@ impl RuntimeOrchestrator {
         } else {
             "overlay 自动同步完成"
         };
-        let level = if error_message.is_some() { "warn" } else { "info" };
+        let level = if error_message.is_some() {
+            "warn"
+        } else {
+            "info"
+        };
         let error_code = error_message
             .as_ref()
             .map(|_| "HEX-OVERLAY-SYNC-FAILED".to_string());
@@ -893,6 +987,7 @@ mod tests {
 
         orchestrator
             .tick(
+                None,
                 &paths,
                 RuntimeTriggerEvent::Manual,
                 Ok(ResolvedPlayerSnapshot {
@@ -938,6 +1033,7 @@ mod tests {
 
         orchestrator
             .tick(
+                None,
                 &paths,
                 RuntimeTriggerEvent::LowFrequencyPoll,
                 Ok(ResolvedPlayerSnapshot {

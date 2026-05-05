@@ -165,11 +165,8 @@ pub fn run_ocr_text_replay(
     let paths = AppPaths::from_app(&app)?;
     paths.ensure_all()?;
     let settings = load_or_create_settings(&paths)?;
-    let dictionary_path = resource_paths::resource_root(&app)
-        .join("dictionaries")
-        .join(AUGMENT_DICTIONARY_ZH_CN);
-    let dictionary =
-        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+    let (dictionary, _) =
+        load_runtime_augment_dictionary(&paths, &settings, &resource_paths::resource_root(&app))?;
     let confidence = input.confidence.unwrap_or(0.95);
     let report = ocr::replay_calibrated_name_slots(
         &dictionary,
@@ -332,7 +329,7 @@ pub async fn run_pixel_calibrated_name_ocr(
 }
 
 #[cfg(not(test))]
-fn run_calibrated_ocr_task(
+pub(crate) fn run_calibrated_ocr_task(
     paths: &AppPaths,
     trace_id: &str,
     resource_root: PathBuf,
@@ -368,24 +365,21 @@ fn run_calibrated_ocr_task(
         resource_status.message.clone(),
     );
 
-    let dictionary_path = prepared
-        .runtime_root
-        .join("dictionaries")
-        .join(AUGMENT_DICTIONARY_ZH_CN);
     log_ocr_stage(
         paths,
         trace_id,
         "ocr-dictionary-load-start",
-        format!("开始加载 OCR 词库 path={}", dictionary_path.display()),
+        "开始加载 OCR 词库".to_string(),
         "准备读取海克斯词库".to_string(),
     );
-    let dictionary =
-        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+    let settings = load_or_create_settings(paths)?;
+    let (dictionary, dictionary_summary) =
+        load_runtime_augment_dictionary(paths, &settings, &prepared.runtime_root)?;
     log_ocr_stage(
         paths,
         trace_id,
         "ocr-dictionary-load-success",
-        format!("OCR 词库加载完成 path={}", dictionary_path.display()),
+        dictionary_summary,
         "海克斯词库加载成功".to_string(),
     );
 
@@ -489,6 +483,67 @@ fn run_calibrated_ocr_task(
     );
 
     Ok(report)
+}
+
+pub(crate) fn load_runtime_augment_dictionary(
+    paths: &AppPaths,
+    settings: &crate::models::AppSettings,
+    resource_root: &std::path::Path,
+) -> Result<(ocr::AugmentDictionary, String), String> {
+    match apex::load_augment_dictionary_with_cache(
+        &paths.cache,
+        apex::ApexLookupSettings {
+            cache_ttl_hours: settings.apex_lol.cache_ttl_hours,
+            request_timeout_ms: settings.apex_lol.request_timeout_ms,
+            failed_cache_ttl_minutes: settings.apex_lol.failed_cache_ttl_minutes,
+        },
+        false,
+    ) {
+        Ok(sync) => {
+            let augment_count = sync.dictionary.augments.len();
+            let dictionary = ocr::AugmentDictionary {
+                locale: sync.dictionary.locale,
+                version: sync.dictionary.version,
+                augments: sync
+                    .dictionary
+                    .augments
+                    .into_iter()
+                    .map(|entry| ocr::AugmentEntry {
+                        id: entry.id,
+                        name: entry.name,
+                        aliases: entry.aliases,
+                    })
+                    .collect(),
+            };
+            Ok((
+                dictionary,
+                format!(
+                    "OCR 词库加载完成 source={} cache={} stale_fallback={} path={} entries={}",
+                    apex::APEX_SOURCE_NAME,
+                    sync.cache_hit,
+                    sync.stale_fallback_used,
+                    sync.cache_path.display(),
+                    augment_count
+                ),
+            ))
+        }
+        Err(fetch_error) => {
+            let dictionary_path = resource_root
+                .join("dictionaries")
+                .join(AUGMENT_DICTIONARY_ZH_CN);
+            let dictionary = ocr::AugmentDictionary::load(&dictionary_path)
+                .map_err(|error| error.to_string())?;
+            Ok((
+                dictionary.clone(),
+                format!(
+                    "OCR 词库加载完成 source=bundled-fallback reason={} path={} entries={}",
+                    fetch_error,
+                    dictionary_path.display(),
+                    dictionary.augments.len()
+                ),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

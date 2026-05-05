@@ -10,6 +10,7 @@ mod ocr;
 mod orchestrator;
 mod overlay;
 mod resource_paths;
+mod runtime_panel;
 mod settings;
 mod state_machine;
 mod telemetry;

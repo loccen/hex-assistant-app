@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
@@ -13,6 +13,29 @@ const INDEX_URLS: [&str; 2] = [
 ];
 pub const APEX_SOURCE_NAME: &str = "ApexLOL";
 pub const NO_DATA_TEXT: &str = "暂无数据";
+const AUGMENT_DICTIONARY_CACHE_FILE: &str = "apex-augment-dictionary.zh-CN.json";
+
+#[cfg(not(test))]
+use crate::ocr::{AugmentDictionary, AugmentEntry};
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AugmentDictionary {
+    pub locale: String,
+    pub version: u32,
+    pub augments: Vec<AugmentEntry>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AugmentEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +170,29 @@ pub struct ApexCacheReportEntry {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexAugmentDictionaryCache {
+    pub version: u32,
+    pub source: String,
+    pub source_urls: Vec<String>,
+    pub fetched_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub dictionary: AugmentDictionary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexAugmentDictionarySyncResult {
+    pub cache_path: PathBuf,
+    pub fetched_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub cache_hit: bool,
+    pub stale_fallback_used: bool,
+    pub source_urls: Vec<String>,
+    pub dictionary: AugmentDictionary,
+}
+
 pub fn lookup_with_cache(
     cache_dir: impl AsRef<Path>,
     request: ApexLookupRequest,
@@ -243,6 +289,73 @@ pub fn build_and_write_cache_report(
     Ok(report)
 }
 
+pub fn load_augment_dictionary_with_cache(
+    cache_dir: impl AsRef<Path>,
+    settings: ApexLookupSettings,
+    force_refresh: bool,
+) -> Result<ApexAugmentDictionarySyncResult, String> {
+    let cache_path = augment_dictionary_cache_path(cache_dir.as_ref());
+    let cached = read_augment_dictionary_cache(&cache_path).ok();
+    let now = Utc::now();
+
+    if !force_refresh {
+        if let Some(cache) = &cached {
+            if cache.expires_at > now && !cache.dictionary.augments.is_empty() {
+                return Ok(ApexAugmentDictionarySyncResult {
+                    cache_path,
+                    fetched_at: cache.fetched_at,
+                    expires_at: cache.expires_at,
+                    cache_hit: true,
+                    stale_fallback_used: false,
+                    source_urls: cache.source_urls.clone(),
+                    dictionary: cache.dictionary.clone(),
+                });
+            }
+        }
+    }
+
+    match fetch_augment_dictionary(&settings) {
+        Ok((dictionary, source_urls)) => {
+            let fetched_at = Utc::now();
+            let expires_at = fetched_at + Duration::hours(settings.cache_ttl_hours as i64);
+            let cache = ApexAugmentDictionaryCache {
+                version: CACHE_VERSION,
+                source: APEX_SOURCE_NAME.to_string(),
+                source_urls: source_urls.clone(),
+                fetched_at,
+                expires_at,
+                dictionary: dictionary.clone(),
+            };
+            write_augment_dictionary_cache(&cache_path, &cache)?;
+            Ok(ApexAugmentDictionarySyncResult {
+                cache_path,
+                fetched_at,
+                expires_at,
+                cache_hit: false,
+                stale_fallback_used: false,
+                source_urls,
+                dictionary,
+            })
+        }
+        Err(fetch_error) => {
+            if let Some(cache) = cached {
+                if !cache.dictionary.augments.is_empty() {
+                    return Ok(ApexAugmentDictionarySyncResult {
+                        cache_path,
+                        fetched_at: cache.fetched_at,
+                        expires_at: cache.expires_at,
+                        cache_hit: true,
+                        stale_fallback_used: true,
+                        source_urls: cache.source_urls,
+                        dictionary: cache.dictionary,
+                    });
+                }
+            }
+            Err(fetch_error)
+        }
+    }
+}
+
 pub fn parse_apex_detail_page(
     html: &str,
     source_url: &str,
@@ -330,6 +443,23 @@ fn fetch_and_parse(request: &ApexLookupRequest, settings: &ApexLookupSettings) -
     }
 }
 
+fn fetch_augment_dictionary(
+    settings: &ApexLookupSettings,
+) -> Result<(AugmentDictionary, Vec<String>), String> {
+    let timeout = StdDuration::from_millis(settings.request_timeout_ms);
+    let zh_html = http_get(INDEX_URLS[0], timeout)
+        .map_err(|error| format!("请求 ApexLOL 中文海克斯索引失败: {error}"))?;
+    let en_html = http_get(INDEX_URLS[1], timeout)
+        .map_err(|error| format!("请求 ApexLOL 英文海克斯索引失败: {error}"))?;
+    let zh_entries = parse_augment_index_entries(&zh_html, "/zh/hextech/");
+    let en_entries = parse_augment_index_entries(&en_html, "/en/hextech/");
+    let dictionary = build_augment_dictionary(zh_entries, en_entries)?;
+    Ok((
+        dictionary,
+        INDEX_URLS.iter().map(|url| (*url).to_string()).collect(),
+    ))
+}
+
 fn find_augment_source_url(
     augment_name: &str,
     timeout: StdDuration,
@@ -402,6 +532,134 @@ fn http_get(url: &str, timeout: StdDuration) -> Result<String, String> {
     response
         .text()
         .map_err(|error| format!("读取 ApexLOL 响应失败: {error}"))
+}
+
+fn parse_augment_index_entries(html: &str, route_prefix: &str) -> BTreeMap<String, String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a[href]").expect("a[href] selector 应合法");
+    let mut entries = BTreeMap::new();
+
+    for element in document.select(&selector) {
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        let Some(key) = augment_key_from_href(href, route_prefix) else {
+            continue;
+        };
+        let text = element
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        entries.entry(key).or_insert(text);
+    }
+
+    entries
+}
+
+fn augment_key_from_href(href: &str, route_prefix: &str) -> Option<String> {
+    let href = href.trim();
+    if !href.starts_with(route_prefix) {
+        return None;
+    }
+    let key = href
+        .trim_start_matches(route_prefix)
+        .trim_matches('/')
+        .trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.replace("&#39;", "'"))
+}
+
+fn build_augment_dictionary(
+    zh_entries: BTreeMap<String, String>,
+    en_entries: BTreeMap<String, String>,
+) -> Result<AugmentDictionary, String> {
+    let mut keys = BTreeSet::new();
+    keys.extend(zh_entries.keys().cloned());
+    keys.extend(en_entries.keys().cloned());
+
+    let augments = keys
+        .into_iter()
+        .filter_map(|key| {
+            let zh_name = zh_entries.get(&key).cloned();
+            let en_name = en_entries.get(&key).cloned();
+            let name = zh_name.or_else(|| en_name.clone())?;
+            let mut aliases = Vec::new();
+            if let Some(alias) = en_name.filter(|alias| alias != &name) {
+                aliases.push(alias);
+            }
+            Some(AugmentEntry {
+                id: key,
+                name,
+                aliases,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if augments.is_empty() {
+        return Err("ApexLOL 海克斯索引解析结果为空，无法构建真实词库".to_string());
+    }
+
+    Ok(AugmentDictionary {
+        locale: "zh-CN".to_string(),
+        version: 1,
+        augments,
+    })
+}
+
+fn augment_dictionary_cache_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(AUGMENT_DICTIONARY_CACHE_FILE)
+}
+
+fn read_augment_dictionary_cache(path: &Path) -> Result<ApexAugmentDictionaryCache, String> {
+    let content = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "无法读取 ApexLOL 海克斯词库缓存 {}: {error}",
+            path.display()
+        )
+    })?;
+    let cache: ApexAugmentDictionaryCache = serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "无法解析 ApexLOL 海克斯词库缓存 {}: {error}",
+            path.display()
+        )
+    })?;
+    if cache.version != CACHE_VERSION {
+        return Err(format!(
+            "ApexLOL 海克斯词库缓存版本不兼容: 期望 {CACHE_VERSION}，实际 {}",
+            cache.version
+        ));
+    }
+    Ok(cache)
+}
+
+fn write_augment_dictionary_cache(
+    path: &Path,
+    cache: &ApexAugmentDictionaryCache,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "无法创建 ApexLOL 海克斯词库缓存目录 {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let content = serde_json::to_string_pretty(cache)
+        .map_err(|error| format!("无法序列化 ApexLOL 海克斯词库缓存: {error}"))?;
+    fs::write(path, format!("{content}\n")).map_err(|error| {
+        format!(
+            "无法写入 ApexLOL 海克斯词库缓存 {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn visible_text(document: &Html) -> Vec<String> {
@@ -841,6 +1099,77 @@ mod tests {
 
         assert!(report_path.exists());
         assert_eq!(report.failed_entries, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_index_entries_into_real_dictionary() {
+        let zh_html = r#"
+        <html><body>
+          <a href="/zh/hextech/">海克斯</a>
+          <a href="/zh/hextech/87">台风</a>
+          <a href="/zh/hextech/juiced">注魔</a>
+        </body></html>
+        "#;
+        let en_html = r#"
+        <html><body>
+          <a href="/en/hextech/">Hextech</a>
+          <a href="/en/hextech/87">Typhoon</a>
+          <a href="/en/hextech/juiced">Juiced</a>
+        </body></html>
+        "#;
+
+        let dictionary = build_augment_dictionary(
+            parse_augment_index_entries(zh_html, "/zh/hextech/"),
+            parse_augment_index_entries(en_html, "/en/hextech/"),
+        )
+        .expect("应能从索引页构建真实词库");
+
+        assert_eq!(dictionary.locale, "zh-CN");
+        assert_eq!(dictionary.augments.len(), 2);
+        assert_eq!(dictionary.augments[0].id, "87");
+        assert_eq!(dictionary.augments[0].name, "台风");
+        assert_eq!(dictionary.augments[0].aliases, vec!["Typhoon".to_string()]);
+    }
+
+    #[test]
+    fn augment_dictionary_cache_prefers_fresh_cache() {
+        let root = temp_dir("apex-augment-dict-cache");
+        let cache_dir = root.join("cache");
+        let fetched_at = Utc::now();
+        let cache = ApexAugmentDictionaryCache {
+            version: CACHE_VERSION,
+            source: APEX_SOURCE_NAME.to_string(),
+            source_urls: vec![INDEX_URLS[0].to_string()],
+            fetched_at,
+            expires_at: fetched_at + Duration::hours(1),
+            dictionary: AugmentDictionary {
+                locale: "zh-CN".to_string(),
+                version: 1,
+                augments: vec![AugmentEntry {
+                    id: "87".to_string(),
+                    name: "台风".to_string(),
+                    aliases: vec!["Typhoon".to_string()],
+                }],
+            },
+        };
+        write_augment_dictionary_cache(&augment_dictionary_cache_path(&cache_dir), &cache)
+            .expect("应能写入海克斯词库缓存");
+
+        let result = load_augment_dictionary_with_cache(
+            &cache_dir,
+            ApexLookupSettings {
+                request_timeout_ms: 1,
+                ..ApexLookupSettings::default()
+            },
+            false,
+        )
+        .expect("应命中海克斯词库缓存");
+
+        assert!(result.cache_hit);
+        assert!(!result.stale_fallback_used);
+        assert_eq!(result.dictionary.augments.len(), 1);
 
         let _ = fs::remove_dir_all(root);
     }
