@@ -29,6 +29,7 @@ pub struct AugmentChoice {
 pub enum PauseReason {
     LiveClientUnavailable,
     InvalidLiveClientData,
+    UnsupportedGameMode,
     InvalidPanelData,
 }
 

@@ -401,7 +401,12 @@ fn run_calibrated_ocr_task(
     );
     let ort_dylib_path = ort_dylib_path(&prepared.runtime_root);
     init_ort_from(&ort_dylib_path)
-        .map_err(|error| format!("无法加载 ONNX Runtime 动态库 {}: {error}", ort_dylib_path.display()))?
+        .map_err(|error| {
+            format!(
+                "无法加载 ONNX Runtime 动态库 {}: {error}",
+                ort_dylib_path.display()
+            )
+        })?
         .commit();
     log_ocr_stage(
         paths,
