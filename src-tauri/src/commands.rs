@@ -497,10 +497,16 @@ pub async fn run_pixel_calibrated_name_ocr(
 }
 
 #[tauri::command]
-pub fn fetch_live_client_active_player() -> Result<ActivePlayerSnapshot, String> {
+pub fn fetch_live_client_resolved_player_snapshot() -> Result<ActivePlayerSnapshot, String> {
     LiveClientDataApi::new()
         .fetch_active_player()
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn fetch_live_client_active_player() -> Result<ActivePlayerSnapshot, String> {
+    // 兼容旧命令名，避免前端或外部脚本在 live_client 新接口合入前后发生破坏。
+    fetch_live_client_resolved_player_snapshot()
 }
 
 #[derive(Debug, Clone, Serialize)]
