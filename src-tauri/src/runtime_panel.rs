@@ -8,7 +8,7 @@ use crate::models::AppSettings;
 #[cfg(not(test))]
 use crate::models::TelemetryEvent;
 #[cfg(not(test))]
-use crate::ocr::{self, AUGMENT_DICTIONARY_ZH_CN};
+use crate::ocr;
 use crate::ocr::{CalibratedNameOcrReport, CalibratedNameOcrSlotReport};
 use crate::state_machine::{AugmentChoice, PanelState};
 #[cfg(not(test))]
@@ -19,6 +19,8 @@ use image::DynamicImage;
 #[cfg(not(test))]
 use ort::init_from as init_ort_from;
 use serde::Serialize;
+#[cfg(not(test))]
+use std::fs;
 #[cfg(not(test))]
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,6 +45,7 @@ pub struct RuntimePanelSnapshotReport {
     pub source_image_path: PathBuf,
     pub capture_report_path: PathBuf,
     pub ocr_report_path: Option<PathBuf>,
+    pub dictionary_source: Option<String>,
     pub capture_black_screen: bool,
     pub capture_stale_frame: bool,
     pub button_region: RegionActivity,
@@ -68,6 +71,7 @@ struct RuntimePanelUpdate {
     pub capture_black_screen: bool,
     pub capture_stale_frame: bool,
     pub ocr_report_path: Option<PathBuf>,
+    pub dictionary_source: Option<String>,
     pub button_region: RegionActivity,
     pub slot_regions: Vec<SlotRegionActivity>,
     pub recognized_slot_count: usize,
@@ -122,6 +126,7 @@ pub fn detect_runtime_panel_snapshot(
                 source_image_path: update.capture_path,
                 capture_report_path: update.capture_report_path,
                 ocr_report_path: update.ocr_report_path,
+                dictionary_source: update.dictionary_source,
                 capture_black_screen: update.capture_black_screen,
                 capture_stale_frame: update.capture_stale_frame,
                 button_region: update.button_region,
@@ -195,6 +200,7 @@ fn capture_runtime_panel(
             capture_black_screen: true,
             capture_stale_frame: capture_report.stale_frame,
             ocr_report_path: None,
+            dictionary_source: None,
             button_region,
             slot_regions,
             recognized_slot_count: 0,
@@ -203,8 +209,8 @@ fn capture_runtime_panel(
 
     let should_run_ocr =
         button_region.visible || slot_regions.iter().filter(|slot| slot.visible).count() >= 2;
-    let ocr_report = if should_run_ocr {
-        Some(run_calibrated_ocr_task(
+    let (ocr_report, dictionary_source) = if should_run_ocr {
+        let (report, dictionary_source) = run_calibrated_ocr_task(
             paths,
             trace_id,
             crate::resource_paths::resource_root(app),
@@ -213,16 +219,17 @@ fn capture_runtime_panel(
             preferred_monitor_id,
             settings.ocr.min_confidence,
             settings.ocr.min_match_score,
-        )?)
+        )?;
+        (Some(report), Some(dictionary_source))
     } else {
-        None
+        (None, None)
     };
 
     let (panel_state, choices) =
         build_panel_result(&button_region, &slot_regions, ocr_report.as_ref());
     let recognized_slot_count = choices.len();
 
-    Ok(RuntimePanelUpdate {
+    let update = RuntimePanelUpdate {
         captured_at: capture_report.captured_at,
         panel_state,
         choices,
@@ -231,10 +238,13 @@ fn capture_runtime_panel(
         capture_black_screen: false,
         capture_stale_frame: capture_report.stale_frame,
         ocr_report_path: ocr_report.as_ref().map(|report| report.report_path.clone()),
+        dictionary_source,
         button_region,
         slot_regions,
         recognized_slot_count,
-    })
+    };
+    write_runtime_panel_diagnostic(paths, trace_id, &update, ocr_report.as_ref())?;
+    Ok(update)
 }
 
 #[cfg(test)]
@@ -249,18 +259,14 @@ fn capture_runtime_panel(
 
 fn build_panel_result(
     button_region: &RegionActivity,
-    slot_regions: &[SlotRegionActivity],
+    _slot_regions: &[SlotRegionActivity],
     ocr_report: Option<&CalibratedNameOcrReport>,
 ) -> (PanelState, Vec<AugmentChoice>) {
     let choices = ocr_report
         .map(|report| build_choices_from_ocr(report.slots.as_slice()))
         .unwrap_or_default();
-    let visible_slot_count = slot_regions.iter().filter(|slot| slot.visible).count();
     let recognized_slot_count = choices.len();
-    let panel_state = if recognized_slot_count >= 2
-        || visible_slot_count >= 2
-        || (button_region.visible && (recognized_slot_count >= 1 || visible_slot_count >= 1))
-    {
+    let panel_state = if button_region.visible && recognized_slot_count >= 1 {
         PanelState::Expanded
     } else {
         PanelState::Collapsed
@@ -402,7 +408,7 @@ pub(crate) fn run_calibrated_ocr_task(
     preferred_monitor_id: Option<u32>,
     min_confidence: f32,
     min_match_score: f32,
-) -> Result<CalibratedNameOcrReport, String> {
+) -> Result<(CalibratedNameOcrReport, String), String> {
     log_ocr_stage(
         paths,
         trace_id,
@@ -430,24 +436,24 @@ pub(crate) fn run_calibrated_ocr_task(
         resource_status.message.clone(),
     );
 
-    let dictionary_path = prepared
-        .runtime_root
-        .join("dictionaries")
-        .join(AUGMENT_DICTIONARY_ZH_CN);
+    let settings = crate::settings::load_or_create_settings(paths)?;
     log_ocr_stage(
         paths,
         trace_id,
         "ocr-dictionary-load-start",
-        format!("开始加载 OCR 词库 path={}", dictionary_path.display()),
+        "开始加载 OCR 词库".to_string(),
         "准备读取海克斯词库".to_string(),
     );
-    let dictionary =
-        ocr::AugmentDictionary::load(&dictionary_path).map_err(|error| error.to_string())?;
+    let (dictionary, dictionary_source) = crate::commands::load_runtime_augment_dictionary(
+        paths,
+        &settings,
+        &prepared.runtime_root,
+    )?;
     log_ocr_stage(
         paths,
         trace_id,
         "ocr-dictionary-load-success",
-        format!("OCR 词库加载完成 path={}", dictionary_path.display()),
+        dictionary_source.clone(),
         "海克斯词库加载成功".to_string(),
     );
 
@@ -552,7 +558,7 @@ pub(crate) fn run_calibrated_ocr_task(
         ),
     );
 
-    Ok(report)
+    Ok((report, dictionary_source))
 }
 
 #[cfg(test)]
@@ -565,7 +571,7 @@ pub(crate) fn run_calibrated_ocr_task(
     _preferred_monitor_id: Option<u32>,
     _min_confidence: f32,
     _min_match_score: f32,
-) -> Result<CalibratedNameOcrReport, String> {
+) -> Result<(CalibratedNameOcrReport, String), String> {
     Err("HEX-OCR-TEST-STUB: 测试编译不执行 OCR 运行时路径".to_string())
 }
 
@@ -616,6 +622,54 @@ fn write_ocr_telemetry(
 }
 
 #[cfg(not(test))]
+fn write_runtime_panel_diagnostic(
+    paths: &AppPaths,
+    trace_id: &str,
+    update: &RuntimePanelUpdate,
+    ocr_report: Option<&CalibratedNameOcrReport>,
+) -> Result<(), String> {
+    let diagnostic_path = paths
+        .reports
+        .join(format!("runtime-panel-diagnostic-{trace_id}.json"));
+    let payload = serde_json::json!({
+        "traceId": trace_id,
+        "capturedAt": update.captured_at,
+        "panelState": update.panel_state,
+        "recognizedSlotCount": update.recognized_slot_count,
+        "choices": update.choices,
+        "capturePath": update.capture_path,
+        "captureReportPath": update.capture_report_path,
+        "captureBlackScreen": update.capture_black_screen,
+        "captureStaleFrame": update.capture_stale_frame,
+        "ocrReportPath": update.ocr_report_path,
+        "dictionarySource": update.dictionary_source,
+        "buttonRegion": update.button_region,
+        "slotRegions": update.slot_regions,
+        "ocrSlots": ocr_report.map(|report| &report.slots),
+    });
+    let content = serde_json::to_string_pretty(&payload).map_err(|error| {
+        format!(
+            "无法序列化运行时面板诊断 {}: {error}",
+            diagnostic_path.display()
+        )
+    })?;
+    fs::write(&diagnostic_path, format!("{content}\n")).map_err(|error| {
+        format!(
+            "无法写入运行时面板诊断 {}: {error}",
+            diagnostic_path.display()
+        )
+    })?;
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "runtime-panel-diagnostic-written",
+        format!("运行时面板诊断已写入 {}", diagnostic_path.display()),
+        "已记录截图、区域活动、OCR 原文与失败原因".to_string(),
+    );
+    Ok(())
+}
+
+#[cfg(not(test))]
 fn ort_dylib_path(resource_root: &Path) -> PathBuf {
     let file_name = if cfg!(target_os = "windows") {
         "onnxruntime.dll"
@@ -633,7 +687,7 @@ mod tests {
     use crate::ocr::{CalibratedNameOcrSlotReport, CalibratedNameSlot, PixelRectReport};
 
     #[test]
-    fn build_panel_result_expands_when_two_slots_visible() {
+    fn build_panel_result_collapses_when_only_visibility_matches() {
         let (panel_state, choices) = build_panel_result(
             &RegionActivity {
                 visible: false,
@@ -671,7 +725,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(panel_state, PanelState::Expanded);
+        assert_eq!(panel_state, PanelState::Collapsed);
         assert!(choices.is_empty());
     }
 

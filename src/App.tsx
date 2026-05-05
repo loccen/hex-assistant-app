@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 declare global {
@@ -342,6 +343,7 @@ function PlayerApp() {
     if (data) {
       setRuntime(data);
       setToast({ tone: "success", message: "助手已开始监听。" });
+      await getCurrentWindow().hide();
     }
   }
 
