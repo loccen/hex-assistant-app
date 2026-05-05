@@ -165,6 +165,11 @@ type Toast = {
   message: string;
 };
 
+type AutomationStatus = {
+  phase: "idle" | "starting" | "active" | "stopping" | "paused" | "error";
+  message: string;
+};
+
 const regionDefinitions: RegionDefinition[] = [
   { key: "name-0", label: "左侧符文名称", help: "拖拽框住左侧名称文字", kind: "rect" },
   { key: "name-1", label: "中间符文名称", help: "拖拽框住中间名称文字", kind: "rect" },
@@ -205,6 +210,10 @@ function PlayerApp() {
   const [calibrated, setCalibrated] = useState<boolean | null>(null);
   const [profile, setProfile] = useState<CalibrationProfileResult | null>(null);
   const [runtime, setRuntime] = useState<RuntimeLoopSnapshot | null>(null);
+  const [automationStatus, setAutomationStatus] = useState<AutomationStatus>({
+    phase: "idle",
+    message: "正在检查校准和监听状态。",
+  });
   const [monitors, setMonitors] = useState<MonitorDiagnostic[]>([]);
   const [selectedMonitorId, setSelectedMonitorId] = useState("");
   const [mode, setMode] = useState<"status" | "calibration">("status");
@@ -218,12 +227,18 @@ function PlayerApp() {
   const [toast, setToast] = useState<Toast | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const runtimeRef = useRef<RuntimeLoopSnapshot | null>(null);
+  const controlQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    runtimeRef.current = runtime;
+  }, [runtime]);
 
   useEffect(() => {
     void boot();
 
     const unlistenRecalibrate = listen("hex-assistant://recalibrate", () => {
-      beginCalibration();
+      void requestRecalibration("监听已暂停，请重新完成校准。");
     });
     const unlistenExport = listen<TrayExportEvent>("hex-assistant://export-status", (event) => {
       setToast({
@@ -260,7 +275,56 @@ function PlayerApp() {
   const readyToSave = readyToCheck && ocrReport !== null;
 
   async function boot() {
-    await Promise.all([loadCalibrationSilently(), refreshRuntime(), loadMonitors()]);
+    const loadedCalibration = await loadCalibrationSilently();
+    const runtimeSnapshot = await refreshRuntime(true);
+    await loadMonitors();
+
+    if (!loadedCalibration) {
+      setAutomationStatus({
+        phase: "idle",
+        message: "尚未完成校准，完成校准后才会自动开始监听。",
+      });
+      return;
+    }
+
+    if (runtimeSnapshot?.listening) {
+      setAutomationStatus({
+        phase: "active",
+        message: "已检测到后台监听正在运行。",
+      });
+      return;
+    }
+
+    await enqueueControlTask(async () => {
+      await ensureListenerRunning({
+        trigger: "startup",
+        successMessage: "检测到已校准配置，助手已自动开始监听。",
+        failureMessage: "检测到已校准配置，但自动监听启动失败",
+      });
+    });
+  }
+
+  async function runManagedCommand<T>(
+    key: string,
+    command: string,
+    args?: Record<string, unknown>,
+    exposeError = true,
+  ): Promise<{ data: T | null; errorMessage: string | null }> {
+    setBusy(key);
+    if (exposeError) {
+      setError(null);
+    }
+    try {
+      return { data: await invoke<T>(command, args), errorMessage: null };
+    } catch (caught) {
+      const errorMessage = String(caught);
+      if (exposeError) {
+        setError(errorMessage);
+      }
+      return { data: null, errorMessage };
+    } finally {
+      setBusy(null);
+    }
   }
 
   async function runCommand<T>(
@@ -269,20 +333,26 @@ function PlayerApp() {
     args?: Record<string, unknown>,
     silent = false,
   ): Promise<T | null> {
-    setBusy(key);
-    if (!silent) {
-      setError(null);
+    const { data } = await runManagedCommand<T>(key, command, args, !silent);
+    return data;
+  }
+
+  function updateRuntimeSnapshot(snapshot: RuntimeLoopSnapshot) {
+    runtimeRef.current = snapshot;
+    setRuntime(snapshot);
+  }
+
+  function enqueueControlTask(task: () => Promise<void>) {
+    const nextTask = controlQueueRef.current.then(task, task);
+    controlQueueRef.current = nextTask.catch(() => undefined);
+    return nextTask;
+  }
+
+  function formatCommandError(errorMessage: string | null, fallback: string) {
+    if (!errorMessage) {
+      return fallback;
     }
-    try {
-      return await invoke<T>(command, args);
-    } catch (caught) {
-      if (!silent) {
-        setError(String(caught));
-      }
-      return null;
-    } finally {
-      setBusy(null);
-    }
+    return errorMessage;
   }
 
   async function loadCalibrationSilently() {
@@ -291,23 +361,26 @@ function PlayerApp() {
       setProfile(loaded);
       setCalibrated(true);
       setMode("status");
+      return true;
     } catch {
       setProfile(null);
       setCalibrated(false);
       setMode("calibration");
+      return false;
     }
   }
 
   async function refreshRuntime(silent = false) {
-    const data = await runCommand<RuntimeLoopSnapshot>(
+    const { data } = await runManagedCommand<RuntimeLoopSnapshot>(
       "runtime-status",
       "get_runtime_orchestrator_status",
       undefined,
-      silent,
+      !silent,
     );
     if (data) {
-      setRuntime(data);
+      updateRuntimeSnapshot(data);
     }
+    return data;
   }
 
   async function loadMonitors() {
@@ -321,7 +394,7 @@ function PlayerApp() {
     }
   }
 
-  function beginCalibration() {
+  function beginCalibration(message = "请按向导重新完成校准。") {
     setMode("calibration");
     setCapture(null);
     setScreenshot(null);
@@ -329,30 +402,127 @@ function PlayerApp() {
     setActiveRegion("name-0");
     setOcrReport(null);
     setError(null);
-    setToast({ tone: "info", message: "请按向导重新完成校准。" });
+    setToast({ tone: "info", message });
     void loadMonitors();
   }
 
-  async function startListener() {
+  async function ensureListenerRunning({
+    trigger,
+    successMessage,
+    failureMessage,
+  }: {
+    trigger: "startup" | "calibration-save";
+    successMessage: string;
+    failureMessage: string;
+  }) {
+    if (runtimeRef.current?.listening) {
+      setAutomationStatus({
+        phase: "active",
+        message: "后台监听已经在运行，无需重复启动。",
+      });
+      return true;
+    }
+
+    setAutomationStatus({
+      phase: "starting",
+      message: trigger === "startup" ? "检测到已校准配置，正在自动启动监听。" : "校准已保存，正在恢复监听。",
+    });
+
     const request: RuntimeTriggerRequest = {
       panelSnapshot: { panelState: "collapsed", choices: [], selectedSlot: null },
     };
-    const data = await runCommand<RuntimeLoopSnapshot>("runtime-start", "start_runtime_listener", {
-      request,
-    });
+    const { data, errorMessage } = await runManagedCommand<RuntimeLoopSnapshot>(
+      "runtime-start",
+      "start_runtime_listener",
+      { request },
+      false,
+    );
     if (data) {
-      setRuntime(data);
-      setToast({ tone: "success", message: "助手已开始监听。" });
+      updateRuntimeSnapshot(data);
+      setAutomationStatus({
+        phase: "active",
+        message: successMessage,
+      });
       await getCurrentWindow().hide();
+      return true;
     }
+    const latest = await refreshRuntime(true);
+    if (latest?.listening) {
+      setAutomationStatus({
+        phase: "active",
+        message: successMessage,
+      });
+      await getCurrentWindow().hide();
+      return true;
+    }
+
+    setAutomationStatus({
+      phase: "error",
+      message: "自动监听未启动，请检查客户端是否可用后再试。",
+    });
+    setToast({
+      tone: "error",
+      message: `${failureMessage}：${formatCommandError(errorMessage, "请检查客户端连接状态。")}`,
+    });
+    return false;
   }
 
-  async function stopListener() {
-    const data = await runCommand<RuntimeLoopSnapshot>("runtime-stop", "stop_runtime_listener");
-    if (data) {
-      setRuntime(data);
-      setToast({ tone: "info", message: "助手已停止监听。" });
+  async function stopListenerForCalibration() {
+    if (!runtimeRef.current?.listening) {
+      setAutomationStatus({
+        phase: "paused",
+        message: "当前未在监听，已直接进入校准流程。",
+      });
+      return true;
     }
+
+    setAutomationStatus({
+      phase: "stopping",
+      message: "正在暂停监听，准备进入校准。",
+    });
+
+    const { data, errorMessage } = await runManagedCommand<RuntimeLoopSnapshot>(
+      "runtime-stop",
+      "stop_runtime_listener",
+      undefined,
+      false,
+    );
+    if (data) {
+      updateRuntimeSnapshot(data);
+      setAutomationStatus({
+        phase: "paused",
+        message: "监听已暂停，等待重新校准完成。",
+      });
+      return true;
+    }
+    const latest = await refreshRuntime(true);
+    if (latest?.listening === false) {
+      setAutomationStatus({
+        phase: "paused",
+        message: "监听已暂停，等待重新校准完成。",
+      });
+      return true;
+    }
+
+    setAutomationStatus({
+      phase: "error",
+      message: "暂停监听失败，暂未进入校准流程。",
+    });
+    setToast({
+      tone: "error",
+      message: `暂停监听失败，未进入校准：${formatCommandError(errorMessage, "请稍后重试。")}`,
+    });
+    return false;
+  }
+
+  async function requestRecalibration(message: string) {
+    await enqueueControlTask(async () => {
+      const stopped = await stopListenerForCalibration();
+      if (!stopped) {
+        return;
+      }
+      beginCalibration(message);
+    });
   }
 
   async function captureAfterDelay() {
@@ -426,7 +596,14 @@ function PlayerApp() {
       setMode("status");
       setToast({
         tone: "success",
-        message: "校准已保存。后续助手将缩到托盘无感运行，可通过托盘重新校准。",
+        message: "校准已保存，正在恢复自动监听。",
+      });
+      void enqueueControlTask(async () => {
+        await ensureListenerRunning({
+          trigger: "calibration-save",
+          successMessage: "校准已保存，助手已恢复自动监听。",
+          failureMessage: "校准已保存，但自动恢复监听失败",
+        });
       });
     }
   }
@@ -491,11 +668,10 @@ function PlayerApp() {
       <StatusPanel
         profile={profile}
         runtime={runtime}
+        automationStatus={automationStatus}
         busy={busy}
-        onStart={startListener}
-        onStop={stopListener}
         onRefresh={() => void refreshRuntime()}
-        onRecalibrate={beginCalibration}
+        onRecalibrate={() => void requestRecalibration("监听已暂停，请重新完成校准。")}
       />
     );
   }
@@ -520,17 +696,15 @@ function PlayerApp() {
 function StatusPanel({
   profile,
   runtime,
+  automationStatus,
   busy,
-  onStart,
-  onStop,
   onRefresh,
   onRecalibrate,
 }: {
   profile: CalibrationProfileResult | null;
   runtime: RuntimeLoopSnapshot | null;
+  automationStatus: AutomationStatus;
   busy: string | null;
-  onStart: () => void;
-  onStop: () => void;
   onRefresh: () => void;
   onRecalibrate: () => void;
 }) {
@@ -557,14 +731,12 @@ function StatusPanel({
           <dt>最近状态</dt>
           <dd>{runtime?.lastErrorCode ?? runtime?.state.pauseReason ?? "正常"}</dd>
         </div>
+        <div>
+          <dt>自动编排</dt>
+          <dd>{automationStatus.message}</dd>
+        </div>
       </dl>
       <div className="button-row">
-        <button type="button" onClick={onStart} disabled={busy !== null || runtime?.listening === true || !profile}>
-          开始监听
-        </button>
-        <button type="button" onClick={onStop} disabled={busy !== null || runtime?.listening !== true}>
-          停止监听
-        </button>
         <button type="button" onClick={onRefresh} disabled={busy !== null}>
           刷新状态
         </button>
