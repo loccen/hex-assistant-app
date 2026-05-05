@@ -9,6 +9,7 @@ use crate::state_machine::{
 use crate::telemetry;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -247,7 +248,11 @@ impl RuntimeOrchestrator {
         live_result: Result<ActivePlayerSnapshot, LiveClientError>,
     ) -> Result<(), String> {
         let start = Instant::now();
-        let (player, pause_reason, error_code, error_message) = match live_result {
+        let live_client_result_category = match &live_result {
+            Ok(_) => "success".to_string(),
+            Err(error) => error.result_category().to_string(),
+        };
+        let (player, pause_reason, error_code, error_message, live_client_details) = match live_result {
             Ok(player) => (
                 Some(LivePlayerSnapshot {
                     champion_name: player.champion_name,
@@ -256,14 +261,31 @@ impl RuntimeOrchestrator {
                 None,
                 None,
                 None,
+                None,
             ),
             Err(error) => (
                 None,
-                Some(error.pause_reason()),
+                Some(match error.pause_reason() {
+                    "LiveClientUnavailable" => PauseReason::LiveClientUnavailable,
+                    "InvalidLiveClientData" => PauseReason::InvalidLiveClientData,
+                    _ => PauseReason::LiveClientUnavailable,
+                }),
                 Some(error.error_code().to_string()),
                 Some(error.to_string()),
+                Some(error.diagnostic_payload()),
             ),
         };
+        let pending_tiers_before_apply = self.machine.state().pending_tiers.clone();
+        self.record_state_machine_input(
+            paths,
+            trigger_event,
+            &live_client_result_category,
+            player.as_ref(),
+            pause_reason.as_ref(),
+            &pending_tiers_before_apply,
+            live_client_details,
+            start.elapsed().as_millis(),
+        )?;
 
         let input = StateMachineInput {
             player: player.clone(),
@@ -288,6 +310,68 @@ impl RuntimeOrchestrator {
             message,
             start.elapsed().as_millis(),
         )
+    }
+
+    fn record_state_machine_input(
+        &mut self,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+        live_client_result_category: &str,
+        player: Option<&LivePlayerSnapshot>,
+        pause_reason: Option<&PauseReason>,
+        pending_tiers: &[u8],
+        live_client_details: Option<serde_json::Value>,
+        duration_ms: u128,
+    ) -> Result<(), String> {
+        let panel_snapshot = json!({
+            "panelState": self.panel_snapshot.panel_state,
+            "selectedSlot": self.panel_snapshot.selected_slot,
+            "choices": self.panel_snapshot.choices,
+        });
+        let message = json!({
+            "kind": "state-machine-input",
+            "triggerEvent": trigger_event,
+            "liveClientResultCategory": live_client_result_category,
+            "championName": player.map(|current| current.champion_name.as_str()),
+            "level": player.map(|current| current.level),
+            "panelSnapshot": panel_snapshot,
+            "pendingTiers": pending_tiers,
+            "pausedReason": pause_reason.map(|reason| format!("{reason:?}")),
+            "liveClientDetails": live_client_details,
+        });
+
+        telemetry::write_event(
+            paths,
+            TelemetryEventInput {
+                stage: "runtime-orchestrator".to_string(),
+                input_summary: format!(
+                    "状态机输入: live_client={}, champion={:?}, level={:?}, panel={:?}, pending_tiers={:?}, paused_reason={:?}",
+                    live_client_result_category,
+                    player.map(|current| current.champion_name.as_str()),
+                    player.map(|current| current.level),
+                    self.panel_snapshot.panel_state,
+                    pending_tiers,
+                    pause_reason
+                ),
+                output_summary: "状态机输入摘要已写入".to_string(),
+                duration_ms,
+                level: if pause_reason.is_some() {
+                    "warn".to_string()
+                } else {
+                    "info".to_string()
+                },
+                error_code: pause_reason.map(|_| {
+                    if live_client_result_category == "http_error" {
+                        "HEX-LIVE-CLIENT-UNAVAILABLE".to_string()
+                    } else {
+                        "HEX-LIVE-CLIENT-PAYLOAD".to_string()
+                    }
+                }),
+                message: message.to_string(),
+            },
+        )?;
+
+        Ok(())
     }
 
     fn record_control_event(
@@ -335,7 +419,7 @@ impl RuntimeOrchestrator {
             })
             .collect::<Vec<_>>();
 
-        let log_payload = serde_json::json!({
+        let log_payload = json!({
             "triggerEvent": trigger_event,
             "championName": log_player.as_ref().map(|player| player.champion_name.as_str()),
             "level": log_player.as_ref().map(|player| player.level),
@@ -392,22 +476,6 @@ impl RuntimeOrchestrator {
     }
 }
 
-impl LiveClientError {
-    fn error_code(&self) -> &'static str {
-        match self {
-            Self::Http(_) => "HEX-LIVE-CLIENT-UNAVAILABLE",
-            Self::InvalidPayload(_) => "HEX-LIVE-CLIENT-PAYLOAD",
-        }
-    }
-
-    fn pause_reason(&self) -> PauseReason {
-        match self {
-            Self::Http(_) => PauseReason::LiveClientUnavailable,
-            Self::InvalidPayload(_) => PauseReason::InvalidLiveClientData,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +520,9 @@ mod tests {
             Some("Ahri")
         );
         assert_eq!(snapshot.recent_events[0].slot_changes.len(), 2);
+        let content = std::fs::read_to_string(paths.app_log_path()).expect("应能读取结构化日志");
+        assert!(content.contains("state-machine-input"));
+        assert!(content.contains("pendingTiers"));
 
         let _ = std::fs::remove_dir_all(paths.root);
     }
