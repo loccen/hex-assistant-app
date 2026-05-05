@@ -502,7 +502,7 @@ function PlayerApp() {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">LOL 海克斯助手</p>
+          <p className="eyebrow">Northlight Panel</p>
           <h1>{mode === "calibration" || calibrated === false ? "首次校准向导" : "助手状态"}</h1>
         </div>
       </header>

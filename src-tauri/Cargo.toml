@@ -1,7 +1,7 @@
 [package]
-name = "hex-assistant-app"
+name = "northlight-panel"
 version = "0.1.0"
-description = "LOL 海克斯助手"
+description = "Northlight Panel"
 authors = ["loccen"]
 edition = "2021"
 

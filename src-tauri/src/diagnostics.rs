@@ -30,6 +30,8 @@ const RELEASE_ZIP_NAME: &str = "hex-assistant-release.zip";
 const RELEASE_ZIP_STAGING_NAME: &str = "hex-assistant-release.next.zip";
 const RELEASE_EXTRACTED_DIR_NAME: &str = "hex-assistant-release";
 const RELEASE_EXTRACTED_STAGING_DIR_NAME: &str = "hex-assistant-release.next";
+const WINDOWS_APP_DISPLAY_NAME: &str = "Northlight Panel";
+const WINDOWS_EXE_NAME: &str = "northlight-panel.exe";
 
 pub fn initialize(app: &AppHandle) -> Result<RuntimeOverview, String> {
     let start = Instant::now();
@@ -463,7 +465,7 @@ pub fn build_release_package(
         "resourceInventory": release_resource_inventory(workspace_root),
         "includedSections": [
             "README.txt",
-            "hex-assistant-app.exe",
+            WINDOWS_EXE_NAME,
             "WebView2Loader.dll",
             "resources",
             "checksums.txt",
@@ -748,30 +750,31 @@ fn extract_release_bundle(zip_path: &Path, target_dir: &Path) -> Result<(), Stri
 
 fn release_root_readme() -> String {
     [
-        "LOL 海克斯助手 Windows 用户包",
-        "",
-        "运行方式：",
-        "1. 解压整个 zip，不要只单独复制 exe。",
-        "2. 双击 hex-assistant-app.exe 启动。",
-        "3. 首次使用前确认 LOL 使用无边框模式，并在应用内完成截图区域校准。",
-        "",
-        "包内资源：",
-        "- 已包含 PP-OCRv4 rec 模型：resources/models/ppocrv4_rec.onnx",
-        "- 已包含 ONNX Runtime：resources/onnxruntime/onnxruntime.dll",
-        "- 已包含 ONNX Runtime 共享库：resources/onnxruntime/onnxruntime_providers_shared.dll",
-        "- 已包含海克斯词库：resources/dictionaries/augments.zh-CN.json",
-        "",
-        "诊断包导出：",
-        "- 右键托盘图标，选择“导出诊断”生成诊断材料。",
-        "- release 包由工程命令生成，普通主界面不展示 release 导出入口。",
-        "- 反馈问题时保留日志、截图样本、OCR 报告和 release-manifest.json。",
-        "",
-        "仍需 Windows 真实验收：",
-        "- 在真实 Windows 桌面启动本 exe。",
-        "- 确认 ppocrv4_rec.onnx 和 onnxruntime.dll 从本包资源目录加载。",
-        "- 确认 Overlay 透明、置顶、不抢焦点、点击穿透。",
-        "- 确认 LOL 无边框模式下真实截图、OCR 和局内流程可用。",
-        "",
+        format!("{WINDOWS_APP_DISPLAY_NAME} Windows 用户包"),
+        String::new(),
+        "运行方式：".to_string(),
+        "1. 解压整个 zip，不要只单独复制 exe。".to_string(),
+        format!("2. 双击 {WINDOWS_EXE_NAME} 启动。"),
+        "3. 首次使用前确认 LOL 使用无边框模式，并在应用内完成截图区域校准。".to_string(),
+        String::new(),
+        "包内资源：".to_string(),
+        "- 已包含 PP-OCRv4 rec 模型：resources/models/ppocrv4_rec.onnx".to_string(),
+        "- 已包含 ONNX Runtime：resources/onnxruntime/onnxruntime.dll".to_string(),
+        "- 已包含 ONNX Runtime 共享库：resources/onnxruntime/onnxruntime_providers_shared.dll"
+            .to_string(),
+        "- 已包含海克斯词库：resources/dictionaries/augments.zh-CN.json".to_string(),
+        String::new(),
+        "诊断包导出：".to_string(),
+        "- 右键托盘图标，选择“导出诊断”生成诊断材料。".to_string(),
+        "- release 包由工程命令生成，普通主界面不展示 release 导出入口。".to_string(),
+        "- 反馈问题时保留日志、截图样本、OCR 报告和 release-manifest.json。".to_string(),
+        String::new(),
+        "仍需 Windows 真实验收：".to_string(),
+        "- 在真实 Windows 桌面启动本 exe。".to_string(),
+        "- 确认 ppocrv4_rec.onnx 和 onnxruntime.dll 从本包资源目录加载。".to_string(),
+        "- 确认 Overlay 透明、置顶、不抢焦点、点击穿透。".to_string(),
+        "- 确认 LOL 无边框模式下真实截图、OCR 和局内流程可用。".to_string(),
+        String::new(),
     ]
     .join("\n")
 }
@@ -823,8 +826,8 @@ fn find_windows_release_artifacts(workspace_root: &Path) -> Vec<PathBuf> {
         .join("x86_64-pc-windows-gnu")
         .join("release");
     for candidate in [
-        target_release.join("hex-assistant-app.exe"),
-        target_release.join("LOL 海克斯助手.exe"),
+        target_release.join(WINDOWS_EXE_NAME),
+        target_release.join(format!("{WINDOWS_APP_DISPLAY_NAME}.exe")),
         target_release.join("WebView2Loader.dll"),
     ] {
         if candidate.is_file() {
@@ -956,7 +959,7 @@ mod tests {
                 .join("target")
                 .join("x86_64-pc-windows-gnu")
                 .join("release")
-                .join("hex-assistant-app.exe"),
+                .join(WINDOWS_EXE_NAME),
             b"pe-stub /index.html",
         )
         .expect("应能写入 Windows exe");
@@ -998,7 +1001,7 @@ mod tests {
         assert_eq!(manifest["packageKind"], "user-release-bundle");
         assert_eq!(manifest["windowsOnly"], true);
         assert!(archive.by_name("README.txt").is_ok());
-        assert!(archive.by_name("hex-assistant-app.exe").is_ok());
+        assert!(archive.by_name(WINDOWS_EXE_NAME).is_ok());
         assert!(archive.by_name("WebView2Loader.dll").is_ok());
         assert!(archive.by_name("resources/models/ppocrv4_rec.onnx").is_ok());
         assert!(archive
@@ -1007,7 +1010,7 @@ mod tests {
         assert!(archive.by_name("dist/index.html").is_err());
         assert!(archive.by_name("docs/README.md").is_err());
         assert!(archive
-            .by_name("installers/linux/hex-assistant-app.deb")
+            .by_name("installers/linux/northlight-panel.deb")
             .is_err());
         assert!(archive.by_name("checksums.txt").is_ok());
         assert_eq!(
@@ -1015,7 +1018,7 @@ mod tests {
                 workspace
                     .join("release")
                     .join(RELEASE_EXTRACTED_DIR_NAME)
-                    .join("hex-assistant-app.exe")
+                    .join(WINDOWS_EXE_NAME)
             )
             .expect("应能读取解压后的 exe"),
             b"pe-stub /index.html"
@@ -1117,7 +1120,7 @@ mod tests {
                 .join("target")
                 .join("x86_64-pc-windows-gnu")
                 .join("release")
-                .join("hex-assistant-app.exe"),
+                .join(WINDOWS_EXE_NAME),
             b"pe-stub-v1 /index.html",
         )
         .expect("应能写入 Windows exe");
@@ -1143,7 +1146,7 @@ mod tests {
                 .join("target")
                 .join("x86_64-pc-windows-gnu")
                 .join("release")
-                .join("hex-assistant-app.exe"),
+                .join(WINDOWS_EXE_NAME),
             b"pe-stub-v2 /index.html",
         )
         .expect("应能更新 Windows exe");
@@ -1172,7 +1175,7 @@ mod tests {
         assert_eq!(first_result.zip_path, second_result.zip_path);
         assert!(!extracted_dir.join("stale.txt").exists());
         assert_eq!(
-            fs::read(extracted_dir.join("hex-assistant-app.exe")).expect("应能读取更新后的 exe"),
+            fs::read(extracted_dir.join(WINDOWS_EXE_NAME)).expect("应能读取更新后的 exe"),
             b"pe-stub-v2 /index.html"
         );
         assert_eq!(

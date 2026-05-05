@@ -388,7 +388,7 @@ fn find_augment_link(index_url: &str, html: &str, augment_name: &str) -> Option<
 fn http_get(url: &str, timeout: StdDuration) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
-        .user_agent("hex-assistant-app/0.1")
+        .user_agent("northlight-panel/0.1")
         .build()
         .map_err(|error| format!("无法创建 ApexLOL 请求客户端: {error}"))?;
     let response = client

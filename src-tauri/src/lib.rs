@@ -94,7 +94,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let mut tray = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .tooltip("LOL 海克斯助手")
+        .tooltip("Northlight Panel")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open-assistant" => show_player_window(app),
             "recalibrate" => {
