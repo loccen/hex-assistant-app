@@ -361,10 +361,17 @@ pub fn sync_runtime_overlay_inner(
     );
 
     if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        overlay_debug_log(&paths, "[runtime_sync] existing_window dispatch_start");
         dispatch_overlay_slots(&window, &slots)?;
+        overlay_debug_log(&paths, "[runtime_sync] existing_window dispatch_done");
+        overlay_debug_log(&paths, "[runtime_sync] existing_window visibility_check_start");
         let was_visible = window.is_visible().map_err(|error| {
             OverlayError::Tauri(format!("HEX-OVERLAY-VISIBILITY-FAILED: {error}"))
         })?;
+        overlay_debug_log(
+            &paths,
+            &format!("[runtime_sync] existing_window visibility_check_done visible={was_visible}"),
+        );
         if was_visible {
             overlay_debug_log(
                 &paths,
@@ -386,11 +393,13 @@ pub fn sync_runtime_overlay_inner(
             });
         }
 
+        overlay_debug_log(&paths, "[runtime_sync] existing_window show_start");
         window.show().map_err(|error| {
             OverlayError::Tauri(format!(
                 "HEX-OVERLAY-SHOW-FAILED: 显示 Overlay 失败: {error}"
             ))
         })?;
+        overlay_debug_log(&paths, "[runtime_sync] existing_window show_done");
         overlay_debug_log(
             &paths,
             &format!(

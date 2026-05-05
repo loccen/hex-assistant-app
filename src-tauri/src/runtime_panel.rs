@@ -279,9 +279,13 @@ fn build_choices_from_ocr(slots: &[CalibratedNameOcrSlotReport]) -> Vec<AugmentC
     slots
         .iter()
         .filter_map(|slot| {
-            slot.augment_id.as_ref().map(|augment_id| AugmentChoice {
+            let display_value = slot
+                .final_name
+                .clone()
+                .or_else(|| slot.augment_id.clone())?;
+            Some(AugmentChoice {
                 slot: slot_index(slot),
-                augment_id: augment_id.clone(),
+                augment_id: display_value,
             })
         })
         .collect()
@@ -789,8 +793,8 @@ mod tests {
         assert_eq!(choices.len(), 2);
         assert_eq!(choices[0].slot, 1);
         assert_eq!(choices[1].slot, 2);
-        assert_eq!(choices[0].augment_id, "prismatic-ticket");
-        assert_eq!(choices[1].augment_id, "build-a-bud");
+        assert_eq!(choices[0].augment_id, "棱彩门票");
+        assert_eq!(choices[1].augment_id, "构建伙伴");
     }
 
     #[test]

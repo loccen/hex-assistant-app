@@ -137,16 +137,20 @@ impl RuntimeOrchestratorHandle {
     ) -> Result<RuntimeLoopSnapshot, String> {
         let paths = AppPaths::from_app(app)?;
         paths.ensure_all()?;
-        let mut orchestrator = self
-            .inner
-            .lock()
-            .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
-        orchestrator.apply_panel_snapshot(request.panel_snapshot);
         let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
-        let overlay_plan =
-            orchestrator.tick(Some(app), &paths, RuntimeTriggerEvent::Manual, live_result)?;
-        orchestrator.sync_overlay(app, &paths, RuntimeTriggerEvent::Manual, &overlay_plan);
-        Ok(orchestrator.snapshot(self.listening.load(Ordering::SeqCst)))
+        let (overlay_plan, snapshot) = {
+            let mut orchestrator = self
+                .inner
+                .lock()
+                .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
+            orchestrator.apply_panel_snapshot(request.panel_snapshot);
+            let overlay_plan =
+                orchestrator.tick(Some(app), &paths, RuntimeTriggerEvent::Manual, live_result)?;
+            let snapshot = orchestrator.snapshot(self.listening.load(Ordering::SeqCst));
+            (overlay_plan, snapshot)
+        };
+        self.sync_overlay_without_lock(app, &paths, RuntimeTriggerEvent::Manual, &overlay_plan);
+        Ok(snapshot)
     }
 
     pub fn start_listener(
@@ -182,19 +186,59 @@ impl RuntimeOrchestratorHandle {
         let handle = thread::spawn(move || {
             while listening.load(Ordering::SeqCst) {
                 let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
-                if let Ok(mut orchestrator) = inner.lock() {
-                    if let Ok(overlay_plan) = orchestrator.tick(
-                        Some(&worker_app),
-                        &worker_paths,
-                        RuntimeTriggerEvent::LowFrequencyPoll,
-                        live_result,
-                    ) {
-                        orchestrator.sync_overlay(
-                            &worker_app,
+                let overlay_plan = if let Ok(mut orchestrator) = inner.lock() {
+                    orchestrator
+                        .tick(
+                            Some(&worker_app),
                             &worker_paths,
                             RuntimeTriggerEvent::LowFrequencyPoll,
-                            &overlay_plan,
-                        );
+                            live_result,
+                        )
+                        .ok()
+                } else {
+                    None
+                };
+                if let Some(overlay_plan) = overlay_plan {
+                    let result = apply_overlay_plan(&worker_app, &overlay_plan);
+                    if let Ok(orchestrator) = inner.lock() {
+                        match result {
+                            Ok(report) => orchestrator.log_overlay_sync_result(
+                                &worker_paths,
+                                RuntimeTriggerEvent::LowFrequencyPoll,
+                                &overlay_plan,
+                                &report,
+                                None,
+                            ),
+                            Err(error) => orchestrator.log_overlay_sync_result(
+                                &worker_paths,
+                                RuntimeTriggerEvent::LowFrequencyPoll,
+                                &overlay_plan,
+                                &RuntimeOverlaySyncReport {
+                                    label: "hex-assistant-overlay".to_string(),
+                                    action: match overlay_plan {
+                                        RuntimeOverlayPlan::Show { .. } => {
+                                            overlay::RuntimeOverlaySyncAction::Created
+                                        }
+                                        RuntimeOverlayPlan::Hide { .. } => {
+                                            overlay::RuntimeOverlaySyncAction::Hidden
+                                        }
+                                    },
+                                    visible: matches!(overlay_plan, RuntimeOverlayPlan::Show { .. }),
+                                    window_exists: false,
+                                    slot_count: match &overlay_plan {
+                                        RuntimeOverlayPlan::Show { slots, .. } => slots.len(),
+                                        RuntimeOverlayPlan::Hide { .. } => 0,
+                                    },
+                                    reason: match &overlay_plan {
+                                        RuntimeOverlayPlan::Show { reason, .. } => reason.clone(),
+                                        RuntimeOverlayPlan::Hide { reason } => reason.clone(),
+                                    },
+                                    log_path: None,
+                                    message: "Overlay 自动同步失败".to_string(),
+                                },
+                                Some(error),
+                            ),
+                        }
                     }
                 }
                 thread::sleep(Duration::from_millis(interval_ms));
@@ -239,6 +283,67 @@ impl RuntimeOrchestratorHandle {
             },
         );
         Ok(orchestrator.snapshot(false))
+    }
+
+    fn sync_overlay_without_lock(
+        &self,
+        app: &AppHandle,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+        overlay_plan: &RuntimeOverlayPlan,
+    ) {
+        let result = apply_overlay_plan(app, overlay_plan);
+        if let Ok(orchestrator) = self.inner.lock() {
+            match result {
+                Ok(report) => orchestrator.log_overlay_sync_result(
+                    paths,
+                    trigger_event,
+                    overlay_plan,
+                    &report,
+                    None,
+                ),
+                Err(error) => orchestrator.log_overlay_sync_result(
+                    paths,
+                    trigger_event,
+                    overlay_plan,
+                    &RuntimeOverlaySyncReport {
+                        label: "hex-assistant-overlay".to_string(),
+                        action: match overlay_plan {
+                            RuntimeOverlayPlan::Show { .. } => overlay::RuntimeOverlaySyncAction::Created,
+                            RuntimeOverlayPlan::Hide { .. } => overlay::RuntimeOverlaySyncAction::Hidden,
+                        },
+                        visible: matches!(overlay_plan, RuntimeOverlayPlan::Show { .. }),
+                        window_exists: false,
+                        slot_count: match overlay_plan {
+                            RuntimeOverlayPlan::Show { slots, .. } => slots.len(),
+                            RuntimeOverlayPlan::Hide { .. } => 0,
+                        },
+                        reason: match overlay_plan {
+                            RuntimeOverlayPlan::Show { reason, .. } => reason.clone(),
+                            RuntimeOverlayPlan::Hide { reason } => reason.clone(),
+                        },
+                        log_path: None,
+                        message: "Overlay 自动同步失败".to_string(),
+                    },
+                    Some(error),
+                ),
+            }
+        }
+    }
+}
+
+fn apply_overlay_plan(
+    app: &AppHandle,
+    overlay_plan: &RuntimeOverlayPlan,
+) -> Result<RuntimeOverlaySyncReport, String> {
+    match overlay_plan {
+        RuntimeOverlayPlan::Show { reason, slots } => {
+            overlay::sync_runtime_overlay_inner(app, slots.clone(), reason)
+                .map_err(|error| error.to_string())
+        }
+        RuntimeOverlayPlan::Hide { reason } => {
+            overlay::hide_runtime_overlay_inner(app, reason).map_err(|error| error.to_string())
+        }
     }
 }
 
