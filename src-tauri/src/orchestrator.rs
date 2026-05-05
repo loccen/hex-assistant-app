@@ -1,5 +1,5 @@
 use crate::app_paths::AppPaths;
-use crate::live_client::{ActivePlayerSnapshot, LiveClientDataApi, LiveClientError};
+use crate::live_client::{LiveClientDataApi, LiveClientError, ResolvedPlayerSnapshot};
 use crate::models::TelemetryEventInput;
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{
@@ -21,6 +21,20 @@ use tauri::AppHandle;
 
 const RECENT_EVENT_LIMIT: usize = 40;
 const MIN_LISTEN_INTERVAL_MS: u64 = 2_500;
+const ALLOWED_GAME_MODES: &[&str] = &["KIWI"];
+const MODE_MISMATCH_ERROR_CODE: &str = "HEX-LIVE-CLIENT-MODE-MISMATCH";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeLiveClientContext {
+    pub active_player_name: Option<String>,
+    pub resolved_champion_name: Option<String>,
+    pub resolved_level: Option<u8>,
+    pub game_mode: Option<String>,
+    pub game_time: Option<f64>,
+    pub source_endpoint: Option<String>,
+    pub fallback_used: Option<bool>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,7 +140,7 @@ impl RuntimeOrchestratorHandle {
             .lock()
             .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
         orchestrator.apply_panel_snapshot(request.panel_snapshot);
-        let live_result = LiveClientDataApi::new().fetch_active_player();
+        let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
         orchestrator.tick(&paths, RuntimeTriggerEvent::Manual, live_result)?;
         Ok(orchestrator.snapshot(self.listening.load(Ordering::SeqCst)))
     }
@@ -162,7 +176,7 @@ impl RuntimeOrchestratorHandle {
         let worker_paths = paths.clone();
         let handle = thread::spawn(move || {
             while listening.load(Ordering::SeqCst) {
-                let live_result = LiveClientDataApi::new().fetch_active_player();
+                let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
                 if let Ok(mut orchestrator) = inner.lock() {
                     let _ = orchestrator.tick(
                         &worker_paths,
@@ -245,26 +259,74 @@ impl RuntimeOrchestrator {
         &mut self,
         paths: &AppPaths,
         trigger_event: RuntimeTriggerEvent,
-        live_result: Result<ActivePlayerSnapshot, LiveClientError>,
+        live_result: Result<ResolvedPlayerSnapshot, LiveClientError>,
     ) -> Result<(), String> {
         let start = Instant::now();
         let live_client_result_category = match &live_result {
             Ok(_) => "success".to_string(),
             Err(error) => error.result_category().to_string(),
         };
-        let (player, pause_reason, error_code, error_message, live_client_details) = match live_result {
-            Ok(player) => (
-                Some(LivePlayerSnapshot {
-                    champion_name: player.champion_name,
-                    level: player.level,
-                }),
-                None,
-                None,
-                None,
-                None,
-            ),
+        let (
+            player,
+            live_client_context,
+            pause_reason,
+            error_code,
+            error_message,
+            live_client_details,
+        ) = match live_result {
+            Ok(snapshot) => {
+                let live_client_context = RuntimeLiveClientContext::from_snapshot(&snapshot);
+                if !is_allowed_game_mode(snapshot.game_mode.as_deref()) {
+                    let mode = snapshot
+                        .game_mode
+                        .clone()
+                        .unwrap_or_else(|| "未知模式".to_string());
+                    (
+                        None,
+                        live_client_context,
+                        Some(PauseReason::UnsupportedGameMode),
+                        Some(MODE_MISMATCH_ERROR_CODE.to_string()),
+                        Some(format!(
+                            "当前模式 {mode} 不在允许列表 {:?}，运行时暂停",
+                            ALLOWED_GAME_MODES
+                        )),
+                        Some(json!({
+                            "activePlayerName": snapshot.active_player_name,
+                            "resolvedChampionName": snapshot.champion_name,
+                            "resolvedLevel": snapshot.level,
+                            "gameMode": snapshot.game_mode,
+                            "gameTime": snapshot.game_time,
+                            "sourceEndpoint": snapshot.source_endpoint,
+                            "fallbackUsed": snapshot.fallback_used,
+                            "allowedModes": ALLOWED_GAME_MODES,
+                        })),
+                    )
+                } else {
+                    (
+                        Some(LivePlayerSnapshot {
+                            champion_name: snapshot.champion_name.clone(),
+                            level: snapshot.level,
+                        }),
+                        live_client_context,
+                        None,
+                        None,
+                        None,
+                        Some(json!({
+                            "activePlayerName": snapshot.active_player_name,
+                            "resolvedChampionName": snapshot.champion_name,
+                            "resolvedLevel": snapshot.level,
+                            "gameMode": snapshot.game_mode,
+                            "gameTime": snapshot.game_time,
+                            "sourceEndpoint": snapshot.source_endpoint,
+                            "fallbackUsed": snapshot.fallback_used,
+                            "allowedModes": ALLOWED_GAME_MODES,
+                        })),
+                    )
+                }
+            }
             Err(error) => (
                 None,
+                RuntimeLiveClientContext::default(),
                 Some(match error.pause_reason() {
                     "LiveClientUnavailable" => PauseReason::LiveClientUnavailable,
                     "InvalidLiveClientData" => PauseReason::InvalidLiveClientData,
@@ -280,6 +342,7 @@ impl RuntimeOrchestrator {
             paths,
             trigger_event,
             &live_client_result_category,
+            &live_client_context,
             player.as_ref(),
             pause_reason.as_ref(),
             &pending_tiers_before_apply,
@@ -296,6 +359,7 @@ impl RuntimeOrchestrator {
         };
         let state_events = self.machine.apply(input);
         self.last_error_code = error_code.clone();
+        self.record_overlay_trigger(paths, trigger_event, &live_client_context, &error_code)?;
 
         let message = match error_message {
             Some(message) => format!("运行时编排暂停: {message}"),
@@ -317,6 +381,7 @@ impl RuntimeOrchestrator {
         paths: &AppPaths,
         trigger_event: RuntimeTriggerEvent,
         live_client_result_category: &str,
+        live_client_context: &RuntimeLiveClientContext,
         player: Option<&LivePlayerSnapshot>,
         pause_reason: Option<&PauseReason>,
         pending_tiers: &[u8],
@@ -332,6 +397,13 @@ impl RuntimeOrchestrator {
             "kind": "state-machine-input",
             "triggerEvent": trigger_event,
             "liveClientResultCategory": live_client_result_category,
+            "activePlayerName": live_client_context.active_player_name,
+            "resolvedChampionName": live_client_context.resolved_champion_name,
+            "resolvedLevel": live_client_context.resolved_level,
+            "gameMode": live_client_context.game_mode,
+            "gameTime": live_client_context.game_time,
+            "sourceEndpoint": live_client_context.source_endpoint,
+            "fallbackUsed": live_client_context.fallback_used,
             "championName": player.map(|current| current.champion_name.as_str()),
             "level": player.map(|current| current.level),
             "panelSnapshot": panel_snapshot,
@@ -345,10 +417,14 @@ impl RuntimeOrchestrator {
             TelemetryEventInput {
                 stage: "runtime-orchestrator".to_string(),
                 input_summary: format!(
-                    "状态机输入: live_client={}, champion={:?}, level={:?}, panel={:?}, pending_tiers={:?}, paused_reason={:?}",
+                    "状态机输入: live_client={}, active_player={:?}, champion={:?}, level={:?}, mode={:?}, source={:?}, fallback_used={:?}, panel={:?}, pending_tiers={:?}, paused_reason={:?}",
                     live_client_result_category,
+                    live_client_context.active_player_name,
                     player.map(|current| current.champion_name.as_str()),
                     player.map(|current| current.level),
+                    live_client_context.game_mode,
+                    live_client_context.source_endpoint,
+                    live_client_context.fallback_used,
                     self.panel_snapshot.panel_state,
                     pending_tiers,
                     pause_reason
@@ -361,7 +437,9 @@ impl RuntimeOrchestrator {
                     "info".to_string()
                 },
                 error_code: pause_reason.map(|_| {
-                    if live_client_result_category == "http_error" {
+                    if matches!(pause_reason, Some(PauseReason::UnsupportedGameMode)) {
+                        MODE_MISMATCH_ERROR_CODE.to_string()
+                    } else if live_client_result_category == "http_error" {
                         "HEX-LIVE-CLIENT-UNAVAILABLE".to_string()
                     } else {
                         "HEX-LIVE-CLIENT-PAYLOAD".to_string()
@@ -370,6 +448,70 @@ impl RuntimeOrchestrator {
                 message: message.to_string(),
             },
         )?;
+
+        Ok(())
+    }
+
+    fn record_overlay_trigger(
+        &mut self,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+        live_client_context: &RuntimeLiveClientContext,
+        error_code: &Option<String>,
+    ) -> Result<(), String> {
+        let state = self.machine.state();
+        let has_visible_choices = !state.visible_choices.is_empty();
+        let has_pending_tiers = !state.pending_tiers.is_empty();
+        let has_panel_choices = !self.panel_snapshot.choices.is_empty();
+        let is_ready = state.pause_reason.is_none()
+            && has_pending_tiers
+            && has_visible_choices
+            && self.panel_snapshot.panel_state == PanelState::Expanded;
+        let base_message = json!({
+            "triggerEvent": trigger_event,
+            "activePlayerName": live_client_context.active_player_name,
+            "resolvedChampionName": live_client_context.resolved_champion_name,
+            "resolvedLevel": live_client_context.resolved_level,
+            "gameMode": live_client_context.game_mode,
+            "gameTime": live_client_context.game_time,
+            "sourceEndpoint": live_client_context.source_endpoint,
+            "fallbackUsed": live_client_context.fallback_used,
+            "allowedModes": ALLOWED_GAME_MODES,
+            "panelState": self.panel_snapshot.panel_state,
+            "pendingTiers": state.pending_tiers,
+            "pauseReason": state.pause_reason.as_ref().map(|reason| format!("{reason:?}")),
+            "hasVisibleChoices": has_visible_choices,
+            "hasPendingChoices": has_panel_choices,
+            "visibleChoiceCount": state.visible_choices.len(),
+        });
+        self.write_runtime_log(
+            paths,
+            "overlay-trigger-check",
+            "overlay 触发检查已记录",
+            "info",
+            None,
+            &base_message,
+        )?;
+
+        if is_ready {
+            self.write_runtime_log(
+                paths,
+                "overlay-trigger-ready",
+                "overlay 已满足触发条件",
+                "info",
+                None,
+                &base_message,
+            )?;
+        } else {
+            self.write_runtime_log(
+                paths,
+                "overlay-trigger-skipped",
+                "overlay 未满足触发条件",
+                if error_code.is_some() { "warn" } else { "info" },
+                error_code.clone(),
+                &base_message,
+            )?;
+        }
 
         Ok(())
     }
@@ -474,6 +616,74 @@ impl RuntimeOrchestrator {
         }
         Ok(())
     }
+
+    fn write_runtime_log(
+        &self,
+        paths: &AppPaths,
+        kind: &str,
+        output_summary: &str,
+        level: &str,
+        error_code: Option<String>,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        telemetry::write_event(
+            paths,
+            TelemetryEventInput {
+                stage: "runtime-orchestrator".to_string(),
+                input_summary: kind.to_string(),
+                output_summary: output_summary.to_string(),
+                duration_ms: 0,
+                level: level.to_string(),
+                error_code,
+                message: json!({
+                    "kind": kind,
+                    "payload": payload,
+                })
+                .to_string(),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+impl Default for RuntimeLiveClientContext {
+    fn default() -> Self {
+        Self {
+            active_player_name: None,
+            resolved_champion_name: None,
+            resolved_level: None,
+            game_mode: None,
+            game_time: None,
+            source_endpoint: None,
+            fallback_used: None,
+        }
+    }
+}
+
+impl RuntimeLiveClientContext {
+    fn from_snapshot(snapshot: &ResolvedPlayerSnapshot) -> Self {
+        Self {
+            active_player_name: Some(snapshot.active_player_name.clone()),
+            resolved_champion_name: Some(snapshot.champion_name.clone()),
+            resolved_level: Some(snapshot.level),
+            game_mode: snapshot.game_mode.clone(),
+            game_time: snapshot.game_time,
+            source_endpoint: Some(snapshot.source_endpoint.clone()),
+            fallback_used: Some(snapshot.fallback_used),
+        }
+    }
+}
+
+fn is_allowed_game_mode(game_mode: Option<&str>) -> bool {
+    game_mode
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(|mode| {
+            ALLOWED_GAME_MODES
+                .iter()
+                .any(|allowed_mode| allowed_mode.eq_ignore_ascii_case(mode))
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -505,9 +715,15 @@ mod tests {
             .tick(
                 &paths,
                 RuntimeTriggerEvent::Manual,
-                Ok(ActivePlayerSnapshot {
+                Ok(ResolvedPlayerSnapshot {
+                    active_player_name: "loccen#65238".to_string(),
                     champion_name: "Ahri".to_string(),
                     level: 11,
+                    game_mode: Some("KIWI".to_string()),
+                    game_time: Some(321.0),
+                    source_endpoint: "https://127.0.0.1:2999/liveclientdata/allgamedata"
+                        .to_string(),
+                    fallback_used: false,
                 }),
             )
             .expect("手动触发应成功");
@@ -523,6 +739,53 @@ mod tests {
         let content = std::fs::read_to_string(paths.app_log_path()).expect("应能读取结构化日志");
         assert!(content.contains("state-machine-input"));
         assert!(content.contains("pendingTiers"));
+        assert!(content.contains("activePlayerName"));
+        assert!(content.contains("overlay-trigger-ready"));
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn unsupported_mode_pauses_and_records_overlay_skip() {
+        let paths = temp_paths("runtime-orchestrator-mode-filter");
+        paths.ensure_all().expect("应能创建测试目录");
+        let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.apply_panel_snapshot(Some(CalibratedPanelSnapshot {
+            panel_state: PanelState::Collapsed,
+            choices: Vec::new(),
+            selected_slot: None,
+        }));
+
+        orchestrator
+            .tick(
+                &paths,
+                RuntimeTriggerEvent::LowFrequencyPoll,
+                Ok(ResolvedPlayerSnapshot {
+                    active_player_name: "loccen#65238".to_string(),
+                    champion_name: "Ahri".to_string(),
+                    level: 5,
+                    game_mode: Some("ARAM".to_string()),
+                    game_time: Some(90.0),
+                    source_endpoint: "https://127.0.0.1:2999/liveclientdata/allgamedata"
+                        .to_string(),
+                    fallback_used: false,
+                }),
+            )
+            .expect("模式过滤日志应成功");
+
+        let snapshot = orchestrator.snapshot(false);
+        assert_eq!(
+            snapshot.state.status,
+            crate::state_machine::AssistantStatus::Paused
+        );
+        assert_eq!(
+            snapshot.state.pause_reason,
+            Some(PauseReason::UnsupportedGameMode)
+        );
+        let content = std::fs::read_to_string(paths.app_log_path()).expect("应能读取结构化日志");
+        assert!(content.contains("HEX-LIVE-CLIENT-MODE-MISMATCH"));
+        assert!(content.contains("overlay-trigger-skipped"));
+        assert!(content.contains("allowedModes"));
 
         let _ = std::fs::remove_dir_all(paths.root);
     }
