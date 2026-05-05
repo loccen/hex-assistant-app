@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -108,6 +108,7 @@ pub struct RuntimeLoopSnapshot {
 pub struct RuntimeOrchestratorHandle {
     inner: Arc<Mutex<RuntimeOrchestrator>>,
     listening: Arc<AtomicBool>,
+    listener_generation: Arc<AtomicU64>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -116,12 +117,89 @@ impl Default for RuntimeOrchestratorHandle {
         Self {
             inner: Arc::new(Mutex::new(RuntimeOrchestrator::new())),
             listening: Arc::new(AtomicBool::new(false)),
+            listener_generation: Arc::new(AtomicU64::new(0)),
             worker: Mutex::new(None),
         }
     }
 }
 
 impl RuntimeOrchestratorHandle {
+    fn apply_listener_request(&self, request: RuntimeTriggerRequest) -> Result<(), String> {
+        let mut orchestrator = self
+            .inner
+            .lock()
+            .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
+        orchestrator.apply_panel_snapshot(request.panel_snapshot);
+        Ok(())
+    }
+
+    fn record_listener_control_event(
+        &self,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+    ) -> Result<(), String> {
+        let mut orchestrator = self
+            .inner
+            .lock()
+            .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
+        orchestrator.record_control_event(paths, trigger_event)
+    }
+
+    fn register_listener_start(
+        &self,
+        paths: &AppPaths,
+        request: RuntimeTriggerRequest,
+    ) -> Result<Option<u64>, String> {
+        self.apply_listener_request(request)?;
+
+        if self.listening.swap(true, Ordering::SeqCst) {
+            return Ok(None);
+        }
+
+        let generation = self.listener_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Err(error) =
+            self.record_listener_control_event(paths, RuntimeTriggerEvent::ListenerStarted)
+        {
+            self.listening.store(false, Ordering::SeqCst);
+            self.listener_generation.fetch_add(1, Ordering::SeqCst);
+            return Err(error);
+        }
+
+        Ok(Some(generation))
+    }
+
+    fn install_worker_handle(
+        &self,
+        generation: u64,
+        handle: JoinHandle<()>,
+    ) -> Result<bool, String> {
+        let should_install = self.listening.load(Ordering::SeqCst)
+            && self.listener_generation.load(Ordering::SeqCst) == generation;
+        if !should_install {
+            handle
+                .join()
+                .map_err(|_| "运行时监听线程退出失败".to_string())?;
+            return Ok(false);
+        }
+
+        let mut worker_slot = self
+            .worker
+            .lock()
+            .map_err(|_| "运行时监听线程锁已损坏".to_string())?;
+        let should_install = self.listening.load(Ordering::SeqCst)
+            && self.listener_generation.load(Ordering::SeqCst) == generation;
+        if !should_install {
+            drop(worker_slot);
+            handle
+                .join()
+                .map_err(|_| "运行时监听线程退出失败".to_string())?;
+            return Ok(false);
+        }
+
+        *worker_slot = Some(handle);
+        Ok(true)
+    }
+
     pub fn snapshot(&self) -> Result<RuntimeLoopSnapshot, String> {
         let orchestrator = self
             .inner
@@ -166,25 +244,19 @@ impl RuntimeOrchestratorHandle {
             .poll_interval_ms
             .max(MIN_LISTEN_INTERVAL_MS);
 
-        {
-            let mut orchestrator = self
-                .inner
-                .lock()
-                .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
-            orchestrator.apply_panel_snapshot(request.panel_snapshot);
-            orchestrator.record_control_event(&paths, RuntimeTriggerEvent::ListenerStarted)?;
-        }
-
-        if self.listening.swap(true, Ordering::SeqCst) {
+        let Some(generation) = self.register_listener_start(&paths, request)? else {
             return self.snapshot();
-        }
+        };
 
         let inner = Arc::clone(&self.inner);
         let listening = Arc::clone(&self.listening);
+        let listener_generation = Arc::clone(&self.listener_generation);
         let worker_paths = paths.clone();
         let worker_app = app.clone();
         let handle = thread::spawn(move || {
-            while listening.load(Ordering::SeqCst) {
+            while listening.load(Ordering::SeqCst)
+                && listener_generation.load(Ordering::SeqCst) == generation
+            {
                 let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
                 let overlay_plan = if let Ok(mut orchestrator) = inner.lock() {
                     orchestrator
@@ -241,27 +313,30 @@ impl RuntimeOrchestratorHandle {
                         }
                     }
                 }
+                if !listening.load(Ordering::SeqCst)
+                    || listener_generation.load(Ordering::SeqCst) != generation
+                {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(interval_ms));
             }
         });
 
-        let mut worker_slot = self
-            .worker
-            .lock()
-            .map_err(|_| "运行时监听线程锁已损坏".to_string())?;
-        *worker_slot = Some(handle);
+        self.install_worker_handle(generation, handle)?;
 
         self.snapshot()
     }
 
     pub fn stop_listener(&self, app: &AppHandle) -> Result<RuntimeLoopSnapshot, String> {
-        self.listening.store(false, Ordering::SeqCst);
-        if let Some(handle) = self
+        let was_listening = self.listening.swap(false, Ordering::SeqCst);
+        self.listener_generation.fetch_add(1, Ordering::SeqCst);
+        let worker_handle = self
             .worker
             .lock()
             .map_err(|_| "运行时监听线程锁已损坏".to_string())?
-            .take()
-        {
+            .take();
+        let had_worker = worker_handle.is_some();
+        if let Some(handle) = worker_handle {
             handle
                 .join()
                 .map_err(|_| "运行时监听线程退出失败".to_string())?;
@@ -273,7 +348,9 @@ impl RuntimeOrchestratorHandle {
             .inner
             .lock()
             .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
-        orchestrator.record_control_event(&paths, RuntimeTriggerEvent::ListenerStopped)?;
+        if was_listening || had_worker {
+            orchestrator.record_control_event(&paths, RuntimeTriggerEvent::ListenerStopped)?;
+        }
         orchestrator.sync_overlay(
             app,
             &paths,
@@ -1259,6 +1336,45 @@ mod tests {
                 reason: "海克斯面板未展开".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn register_listener_start_is_idempotent() {
+        let paths = temp_paths("runtime-orchestrator-listener-start");
+        paths.ensure_all().expect("应能创建测试目录");
+        let handle = RuntimeOrchestratorHandle::default();
+
+        let first_generation = handle
+            .register_listener_start(
+                &paths,
+                RuntimeTriggerRequest {
+                    panel_snapshot: Some(CalibratedPanelSnapshot::default()),
+                },
+            )
+            .expect("首次注册监听应成功");
+        let second_generation = handle
+            .register_listener_start(
+                &paths,
+                RuntimeTriggerRequest {
+                    panel_snapshot: Some(CalibratedPanelSnapshot::default()),
+                },
+            )
+            .expect("重复注册监听应返回当前快照");
+
+        assert_eq!(first_generation, Some(1));
+        assert_eq!(second_generation, None);
+        assert!(handle.listening.load(Ordering::SeqCst));
+        assert_eq!(handle.listener_generation.load(Ordering::SeqCst), 1);
+        let snapshot = handle.snapshot().expect("应能读取运行时快照");
+        assert_eq!(snapshot.recent_events.len(), 1);
+        assert_eq!(
+            snapshot.recent_events[0].trigger_event,
+            RuntimeTriggerEvent::ListenerStarted
+        );
+
+        handle.listening.store(false, Ordering::SeqCst);
+        handle.listener_generation.fetch_add(1, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(paths.root);
     }
 
     fn temp_paths(label: &str) -> AppPaths {
