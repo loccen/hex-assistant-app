@@ -127,6 +127,30 @@ pub struct OverlaySlotUpdateReport {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuntimeOverlaySyncAction {
+    Created,
+    Updated,
+    UpdatedAndShown,
+    Hidden,
+    AlreadyHidden,
+    NoWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeOverlaySyncReport {
+    pub label: String,
+    pub action: RuntimeOverlaySyncAction,
+    pub visible: bool,
+    pub window_exists: bool,
+    pub slot_count: usize,
+    pub reason: String,
+    pub log_path: Option<PathBuf>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayCreationParams {
@@ -315,6 +339,167 @@ pub fn update_overlay_slots(
     slots: Vec<OverlaySlotData>,
 ) -> Result<OverlaySlotUpdateReport, String> {
     update_overlay_slots_inner(&app, slots).map_err(|error| error.to_string())
+}
+
+pub fn sync_runtime_overlay_inner(
+    app: &AppHandle,
+    slots: Vec<OverlaySlotData>,
+    reason: &str,
+) -> Result<RuntimeOverlaySyncReport, OverlayError> {
+    let paths = prepare_paths(app)?;
+    overlay_debug_log(
+        &paths,
+        &format!(
+            "[runtime_sync] requested action=show reason={} slots={}",
+            reason,
+            slots
+                .iter()
+                .map(|slot| format!("{}:{}", slot.slot, slot.title))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    );
+
+    if let Some(window) = app.get_webview_window(OVERLAY_LABEL) {
+        dispatch_overlay_slots(&window, &slots)?;
+        let was_visible = window
+            .is_visible()
+            .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-VISIBILITY-FAILED: {error}")))?;
+        if was_visible {
+            overlay_debug_log(
+                &paths,
+                &format!(
+                    "[runtime_sync] action=updated reason={} slot_count={}",
+                    reason,
+                    slots.len()
+                ),
+            );
+            return Ok(RuntimeOverlaySyncReport {
+                label: OVERLAY_LABEL.to_string(),
+                action: RuntimeOverlaySyncAction::Updated,
+                visible: true,
+                window_exists: true,
+                slot_count: slots.len(),
+                reason: reason.to_string(),
+                log_path: Some(paths.overlay_debug_log_path()),
+                message: "Overlay 已更新实时 slot 数据。".to_string(),
+            });
+        }
+
+        window.show().map_err(|error| {
+            OverlayError::Tauri(format!("HEX-OVERLAY-SHOW-FAILED: 显示 Overlay 失败: {error}"))
+        })?;
+        overlay_debug_log(
+            &paths,
+            &format!(
+                "[runtime_sync] action=updated_and_shown reason={} slot_count={}",
+                reason,
+                slots.len()
+            ),
+        );
+        return Ok(RuntimeOverlaySyncReport {
+            label: OVERLAY_LABEL.to_string(),
+            action: RuntimeOverlaySyncAction::UpdatedAndShown,
+            visible: true,
+            window_exists: true,
+            slot_count: slots.len(),
+            reason: reason.to_string(),
+            log_path: Some(paths.overlay_debug_log_path()),
+            message: "Overlay 已恢复显示并更新实时 slot 数据。".to_string(),
+        });
+    }
+
+    let report = show_overlay_test_card_inner(
+        app,
+        OverlayTestCardRequest {
+            slots,
+            ..OverlayTestCardRequest::default()
+        },
+    )?;
+    overlay_debug_log(
+        &paths,
+        &format!(
+            "[runtime_sync] action=created reason={} slot_count={}",
+            reason,
+            report.cards.len()
+        ),
+    );
+    Ok(RuntimeOverlaySyncReport {
+        label: OVERLAY_LABEL.to_string(),
+        action: RuntimeOverlaySyncAction::Created,
+        visible: true,
+        window_exists: true,
+        slot_count: report.cards.len(),
+        reason: reason.to_string(),
+        log_path: Some(paths.overlay_debug_log_path()),
+        message: "Overlay 已按实时数据自动创建。".to_string(),
+    })
+}
+
+pub fn hide_runtime_overlay_inner(
+    app: &AppHandle,
+    reason: &str,
+) -> Result<RuntimeOverlaySyncReport, OverlayError> {
+    let paths = prepare_paths(app)?;
+    overlay_debug_log(
+        &paths,
+        &format!("[runtime_sync] requested action=hide reason={reason}"),
+    );
+
+    let Some(window) = app.get_webview_window(OVERLAY_LABEL) else {
+        overlay_debug_log(
+            &paths,
+            &format!("[runtime_sync] action=no_window reason={reason}"),
+        );
+        return Ok(RuntimeOverlaySyncReport {
+            label: OVERLAY_LABEL.to_string(),
+            action: RuntimeOverlaySyncAction::NoWindow,
+            visible: false,
+            window_exists: false,
+            slot_count: 0,
+            reason: reason.to_string(),
+            log_path: Some(paths.overlay_debug_log_path()),
+            message: "Overlay 窗口不存在，无需隐藏。".to_string(),
+        });
+    };
+
+    let was_visible = window
+        .is_visible()
+        .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-VISIBILITY-FAILED: {error}")))?;
+    if !was_visible {
+        overlay_debug_log(
+            &paths,
+            &format!("[runtime_sync] action=already_hidden reason={reason}"),
+        );
+        return Ok(RuntimeOverlaySyncReport {
+            label: OVERLAY_LABEL.to_string(),
+            action: RuntimeOverlaySyncAction::AlreadyHidden,
+            visible: false,
+            window_exists: true,
+            slot_count: 0,
+            reason: reason.to_string(),
+            log_path: Some(paths.overlay_debug_log_path()),
+            message: "Overlay 已处于隐藏状态。".to_string(),
+        });
+    }
+
+    window
+        .hide()
+        .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-HIDE-FAILED: {error}")))?;
+    overlay_debug_log(
+        &paths,
+        &format!("[runtime_sync] action=hidden reason={reason}"),
+    );
+    Ok(RuntimeOverlaySyncReport {
+        label: OVERLAY_LABEL.to_string(),
+        action: RuntimeOverlaySyncAction::Hidden,
+        visible: false,
+        window_exists: true,
+        slot_count: 0,
+        reason: reason.to_string(),
+        log_path: Some(paths.overlay_debug_log_path()),
+        message: "Overlay 已按运行时状态自动隐藏。".to_string(),
+    })
 }
 
 pub fn show_overlay_test_card_inner(
@@ -553,7 +738,23 @@ pub fn update_overlay_slots_inner(
             "HEX-OVERLAY-NOT-VISIBLE: Overlay 窗口不存在，请先显示静态测试卡片。".to_string(),
         )
     })?;
-    let payload = serde_json::to_string(&slots)
+    dispatch_overlay_slots(&window, &slots)?;
+    overlay_debug_log(&paths, "[update_slots] eval_dispatched");
+
+    Ok(OverlaySlotUpdateReport {
+        label: OVERLAY_LABEL.to_string(),
+        visible: true,
+        updated_slots: slots,
+        log_path: Some(paths.overlay_debug_log_path()),
+        message: "已向 Overlay 窗口发送真实 slot 数据更新。".to_string(),
+    })
+}
+
+fn dispatch_overlay_slots(
+    window: &WebviewWindow,
+    slots: &[OverlaySlotData],
+) -> Result<(), OverlayError> {
+    let payload = serde_json::to_string(slots)
         .map_err(|error| OverlayError::Tauri(format!("HEX-OVERLAY-SERIALIZE-FAILED: {error}")))?;
     let script = format!(
         "window.dispatchEvent(new CustomEvent('hex-overlay-slots', {{ detail: {} }}));",
@@ -564,15 +765,7 @@ pub fn update_overlay_slots_inner(
             "HEX-OVERLAY-UPDATE-FAILED: 更新 slot 数据失败: {error}"
         ))
     })?;
-    overlay_debug_log(&paths, "[update_slots] eval_dispatched");
-
-    Ok(OverlaySlotUpdateReport {
-        label: OVERLAY_LABEL.to_string(),
-        visible: true,
-        updated_slots: slots,
-        log_path: Some(paths.overlay_debug_log_path()),
-        message: "已向 Overlay 窗口发送真实 slot 数据更新。".to_string(),
-    })
+    Ok(())
 }
 
 pub fn plan_overlay_bounds(

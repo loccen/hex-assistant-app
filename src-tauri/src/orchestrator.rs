@@ -1,6 +1,7 @@
 use crate::app_paths::AppPaths;
 use crate::live_client::{LiveClientDataApi, LiveClientError, ResolvedPlayerSnapshot};
 use crate::models::TelemetryEventInput;
+use crate::overlay::{self, OverlaySlotData, RuntimeOverlaySyncReport};
 use crate::settings::load_or_create_settings;
 use crate::state_machine::{
     AssistantState, AssistantStateMachine, AugmentChoice, LivePlayerSnapshot, PanelState,
@@ -141,7 +142,8 @@ impl RuntimeOrchestratorHandle {
             .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
         orchestrator.apply_panel_snapshot(request.panel_snapshot);
         let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
-        orchestrator.tick(&paths, RuntimeTriggerEvent::Manual, live_result)?;
+        let overlay_plan = orchestrator.tick(&paths, RuntimeTriggerEvent::Manual, live_result)?;
+        orchestrator.sync_overlay(app, &paths, RuntimeTriggerEvent::Manual, &overlay_plan);
         Ok(orchestrator.snapshot(self.listening.load(Ordering::SeqCst)))
     }
 
@@ -174,15 +176,23 @@ impl RuntimeOrchestratorHandle {
         let inner = Arc::clone(&self.inner);
         let listening = Arc::clone(&self.listening);
         let worker_paths = paths.clone();
+        let worker_app = app.clone();
         let handle = thread::spawn(move || {
             while listening.load(Ordering::SeqCst) {
                 let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
                 if let Ok(mut orchestrator) = inner.lock() {
-                    let _ = orchestrator.tick(
+                    if let Ok(overlay_plan) = orchestrator.tick(
                         &worker_paths,
                         RuntimeTriggerEvent::LowFrequencyPoll,
                         live_result,
-                    );
+                    ) {
+                        orchestrator.sync_overlay(
+                            &worker_app,
+                            &worker_paths,
+                            RuntimeTriggerEvent::LowFrequencyPoll,
+                            &overlay_plan,
+                        );
+                    }
                 }
                 thread::sleep(Duration::from_millis(interval_ms));
             }
@@ -217,6 +227,14 @@ impl RuntimeOrchestratorHandle {
             .lock()
             .map_err(|_| "运行时编排器状态锁已损坏".to_string())?;
         orchestrator.record_control_event(&paths, RuntimeTriggerEvent::ListenerStopped)?;
+        orchestrator.sync_overlay(
+            app,
+            &paths,
+            RuntimeTriggerEvent::ListenerStopped,
+            &RuntimeOverlayPlan::Hide {
+                reason: "监听已停止，自动隐藏 Overlay".to_string(),
+            },
+        );
         Ok(orchestrator.snapshot(false))
     }
 }
@@ -227,6 +245,18 @@ struct RuntimeOrchestrator {
     panel_snapshot: CalibratedPanelSnapshot,
     recent_events: VecDeque<RuntimeStructuredEvent>,
     last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+enum RuntimeOverlayPlan {
+    Show {
+        reason: String,
+        slots: Vec<OverlaySlotData>,
+    },
+    Hide {
+        reason: String,
+    },
 }
 
 impl RuntimeOrchestrator {
@@ -260,7 +290,7 @@ impl RuntimeOrchestrator {
         paths: &AppPaths,
         trigger_event: RuntimeTriggerEvent,
         live_result: Result<ResolvedPlayerSnapshot, LiveClientError>,
-    ) -> Result<(), String> {
+    ) -> Result<RuntimeOverlayPlan, String> {
         let start = Instant::now();
         let live_client_result_category = match &live_result {
             Ok(_) => "success".to_string(),
@@ -359,7 +389,14 @@ impl RuntimeOrchestrator {
         };
         let state_events = self.machine.apply(input);
         self.last_error_code = error_code.clone();
-        self.record_overlay_trigger(paths, trigger_event, &live_client_context, &error_code)?;
+        let overlay_plan = self.build_overlay_plan();
+        self.record_overlay_trigger(
+            paths,
+            trigger_event,
+            &live_client_context,
+            &error_code,
+            &overlay_plan,
+        )?;
 
         let message = match error_message {
             Some(message) => format!("运行时编排暂停: {message}"),
@@ -373,7 +410,8 @@ impl RuntimeOrchestrator {
             error_code,
             message,
             start.elapsed().as_millis(),
-        )
+        )?;
+        Ok(overlay_plan)
     }
 
     fn record_state_machine_input(
@@ -458,15 +496,18 @@ impl RuntimeOrchestrator {
         trigger_event: RuntimeTriggerEvent,
         live_client_context: &RuntimeLiveClientContext,
         error_code: &Option<String>,
+        overlay_plan: &RuntimeOverlayPlan,
     ) -> Result<(), String> {
         let state = self.machine.state();
         let has_visible_choices = !state.visible_choices.is_empty();
         let has_pending_tiers = !state.pending_tiers.is_empty();
         let has_panel_choices = !self.panel_snapshot.choices.is_empty();
-        let is_ready = state.pause_reason.is_none()
-            && has_pending_tiers
-            && has_visible_choices
-            && self.panel_snapshot.panel_state == PanelState::Expanded;
+        let (planned_action, plan_reason, planned_slot_count, is_ready) = match overlay_plan {
+            RuntimeOverlayPlan::Show { reason, slots } => {
+                ("show", reason.as_str(), slots.len(), true)
+            }
+            RuntimeOverlayPlan::Hide { reason } => ("hide", reason.as_str(), 0, false),
+        };
         let base_message = json!({
             "triggerEvent": trigger_event,
             "activePlayerName": live_client_context.active_player_name,
@@ -480,9 +521,13 @@ impl RuntimeOrchestrator {
             "panelState": self.panel_snapshot.panel_state,
             "pendingTiers": state.pending_tiers,
             "pauseReason": state.pause_reason.as_ref().map(|reason| format!("{reason:?}")),
+            "hasPendingTiers": has_pending_tiers,
             "hasVisibleChoices": has_visible_choices,
             "hasPendingChoices": has_panel_choices,
             "visibleChoiceCount": state.visible_choices.len(),
+            "plannedAction": planned_action,
+            "plannedReason": plan_reason,
+            "plannedSlotCount": planned_slot_count,
         });
         self.write_runtime_log(
             paths,
@@ -514,6 +559,141 @@ impl RuntimeOrchestrator {
         }
 
         Ok(())
+    }
+
+    fn build_overlay_plan(&self) -> RuntimeOverlayPlan {
+        let state = self.machine.state();
+        if let Some(reason) = state.pause_reason.as_ref() {
+            return RuntimeOverlayPlan::Hide {
+                reason: format!("运行时已暂停：{reason:?}"),
+            };
+        }
+        if self.panel_snapshot.panel_state != PanelState::Expanded {
+            return RuntimeOverlayPlan::Hide {
+                reason: "海克斯面板未展开".to_string(),
+            };
+        }
+        if state.pending_tiers.is_empty() || state.pending_tier.is_none() {
+            return RuntimeOverlayPlan::Hide {
+                reason: "当前没有待处理海克斯档位".to_string(),
+            };
+        }
+        if state.visible_choices.is_empty() {
+            return RuntimeOverlayPlan::Hide {
+                reason: "当前没有可展示的海克斯选项".to_string(),
+            };
+        }
+
+        let pending_tier = state.pending_tier.unwrap_or_default();
+        let champion_name = state
+            .player
+            .as_ref()
+            .map(|player| player.champion_name.as_str())
+            .unwrap_or("当前对局");
+        RuntimeOverlayPlan::Show {
+            reason: format!("海克斯面板已展开且待处理档位 {pending_tier} 可展示"),
+            slots: state
+                .visible_choices
+                .iter()
+                .map(|(slot, augment_id)| OverlaySlotData {
+                    slot: *slot,
+                    title: augment_id.clone(),
+                    body: Some(format!(
+                        "{champion_name} · 第 {pending_tier} 档海克斯 · 槽位 {slot}"
+                    )),
+                    augment_id: Some(augment_id.clone()),
+                    rank: None,
+                    score: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn sync_overlay(
+        &self,
+        app: &AppHandle,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+        overlay_plan: &RuntimeOverlayPlan,
+    ) {
+        let result = match overlay_plan {
+            RuntimeOverlayPlan::Show { reason, slots } => {
+                overlay::sync_runtime_overlay_inner(app, slots.clone(), reason)
+            }
+            RuntimeOverlayPlan::Hide { reason } => overlay::hide_runtime_overlay_inner(app, reason),
+        };
+
+        match result {
+            Ok(report) => self.log_overlay_sync_result(
+                paths,
+                trigger_event,
+                overlay_plan,
+                &report,
+                None,
+            ),
+            Err(error) => self.log_overlay_sync_result(
+                paths,
+                trigger_event,
+                overlay_plan,
+                &RuntimeOverlaySyncReport {
+                    label: "hex-assistant-overlay".to_string(),
+                    action: match overlay_plan {
+                        RuntimeOverlayPlan::Show { .. } => overlay::RuntimeOverlaySyncAction::Created,
+                        RuntimeOverlayPlan::Hide { .. } => overlay::RuntimeOverlaySyncAction::Hidden,
+                    },
+                    visible: matches!(overlay_plan, RuntimeOverlayPlan::Show { .. }),
+                    window_exists: false,
+                    slot_count: match overlay_plan {
+                        RuntimeOverlayPlan::Show { slots, .. } => slots.len(),
+                        RuntimeOverlayPlan::Hide { .. } => 0,
+                    },
+                    reason: match overlay_plan {
+                        RuntimeOverlayPlan::Show { reason, .. } => reason.clone(),
+                        RuntimeOverlayPlan::Hide { reason } => reason.clone(),
+                    },
+                    log_path: None,
+                    message: "Overlay 自动同步失败".to_string(),
+                },
+                Some(error.to_string()),
+            ),
+        }
+    }
+
+    fn log_overlay_sync_result(
+        &self,
+        paths: &AppPaths,
+        trigger_event: RuntimeTriggerEvent,
+        overlay_plan: &RuntimeOverlayPlan,
+        report: &RuntimeOverlaySyncReport,
+        error_message: Option<String>,
+    ) {
+        let payload = json!({
+            "triggerEvent": trigger_event,
+            "plan": overlay_plan,
+            "report": report,
+            "state": self.machine.state(),
+            "panelState": self.panel_snapshot.panel_state,
+            "errorMessage": error_message,
+        });
+        let kind = if error_message.is_some() {
+            "overlay-sync-failed"
+        } else {
+            "overlay-sync-applied"
+        };
+        let output_summary = if error_message.is_some() {
+            "overlay 自动同步失败"
+        } else {
+            "overlay 自动同步完成"
+        };
+        let level = if error_message.is_some() { "warn" } else { "info" };
+        let error_code = error_message
+            .as_ref()
+            .map(|_| "HEX-OVERLAY-SYNC-FAILED".to_string());
+        if let Err(log_error) =
+            self.write_runtime_log(paths, kind, output_summary, level, error_code, &payload)
+        {
+            eprintln!("写入 overlay 自动同步日志失败: {log_error}");
+        }
     }
 
     fn record_control_event(
@@ -788,6 +968,96 @@ mod tests {
         assert!(content.contains("allowedModes"));
 
         let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn overlay_plan_shows_visible_choices_when_runtime_ready() {
+        let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.machine.apply(StateMachineInput {
+            player: Some(LivePlayerSnapshot {
+                champion_name: "Ahri".to_string(),
+                level: 7,
+            }),
+            panel_state: PanelState::Expanded,
+            choices: vec![
+                AugmentChoice {
+                    slot: 1,
+                    augment_id: "prismatic-ticket".to_string(),
+                },
+                AugmentChoice {
+                    slot: 3,
+                    augment_id: "trade-sector".to_string(),
+                },
+            ],
+            selected_slot: None,
+            pause_reason: None,
+        });
+        orchestrator.panel_snapshot = CalibratedPanelSnapshot {
+            panel_state: PanelState::Expanded,
+            choices: vec![
+                AugmentChoice {
+                    slot: 1,
+                    augment_id: "prismatic-ticket".to_string(),
+                },
+                AugmentChoice {
+                    slot: 3,
+                    augment_id: "trade-sector".to_string(),
+                },
+            ],
+            selected_slot: None,
+        };
+
+        let plan = orchestrator.build_overlay_plan();
+        match plan {
+            RuntimeOverlayPlan::Show { reason, slots } => {
+                assert!(reason.contains("待处理档位 3"));
+                assert_eq!(slots.len(), 2);
+                assert_eq!(slots[0].slot, 1);
+                assert_eq!(slots[0].title, "prismatic-ticket");
+                assert_eq!(slots[0].augment_id.as_deref(), Some("prismatic-ticket"));
+                assert!(slots[0]
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains("Ahri")));
+            }
+            RuntimeOverlayPlan::Hide { reason } => {
+                panic!("期望生成显示计划，实际隐藏: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_plan_hides_when_panel_is_collapsed() {
+        let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.machine.apply(StateMachineInput {
+            player: Some(LivePlayerSnapshot {
+                champion_name: "Ahri".to_string(),
+                level: 7,
+            }),
+            panel_state: PanelState::Collapsed,
+            choices: vec![AugmentChoice {
+                slot: 1,
+                augment_id: "prismatic-ticket".to_string(),
+            }],
+            selected_slot: None,
+            pause_reason: None,
+        });
+        orchestrator.panel_snapshot = CalibratedPanelSnapshot {
+            panel_state: PanelState::Collapsed,
+            choices: vec![AugmentChoice {
+                slot: 1,
+                augment_id: "prismatic-ticket".to_string(),
+            }],
+            selected_slot: None,
+        };
+
+        let plan = orchestrator.build_overlay_plan();
+        assert_eq!(
+            plan,
+            RuntimeOverlayPlan::Hide {
+                reason: "海克斯面板未展开".to_string(),
+            }
+        );
     }
 
     fn temp_paths(label: &str) -> AppPaths {
