@@ -38,6 +38,9 @@ mise exec -- cargo check --manifest-path src-tauri/Cargo.toml
 
 涉及具体功能时，还要运行该阶段对应的功能验证或离线回放验证。阶段完成后使用中文提交；如果配置了 remote，验证通过后 push。
 
+- 只要本轮修改了代码，默认还必须重新构建一份可交付的 Windows 安装包给用户测试，除非用户明确说明这轮不需要安装包。
+- 构建 Windows 安装包后，答复中必须明确给出安装包产物路径和本轮实际执行的构建命令。
+
 ## 代码组织
 
 - Rust 侧按职责拆模块，不把所有 Tauri command 堆在一个文件。
