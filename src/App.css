@@ -404,6 +404,80 @@ h2 {
   gap: 16px;
 }
 
+.wizard-intro {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+}
+
+.workspace-stack {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 16px;
+}
+
+.step-panel {
+  width: min(720px, 100%);
+  display: grid;
+  gap: 20px;
+  padding: 28px;
+}
+
+.step-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.step-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid rgba(194, 221, 210, 0.16);
+  border-radius: 999px;
+  color: var(--text-soft);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.8rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.step-progress-bar {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.step-progress-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7ee0ab, #f2cb76);
+}
+
+.step-panel-copy {
+  display: grid;
+  gap: 10px;
+}
+
+.step-title {
+  margin-bottom: 0;
+  color: #92cdb2;
+  font-size: 0.88rem;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.step-actions {
+  justify-content: space-between;
+}
+
 .guide-panel {
   align-self: start;
   display: grid;
@@ -476,6 +550,13 @@ h2 {
   color: var(--text-soft);
   font-size: 0.88rem;
   font-weight: 800;
+}
+
+.capture-controls-standalone {
+  padding: 18px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent),
+    rgba(255, 255, 255, 0.03);
 }
 
 .marking-panel,
@@ -670,6 +751,64 @@ h2 {
 .region-list {
   display: grid;
   gap: 10px;
+}
+
+.ocr-preview-list {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.ocr-preview-card {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid rgba(188, 208, 202, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ocr-preview-card.warn {
+  border-color: rgba(242, 203, 118, 0.34);
+  background: rgba(77, 56, 23, 0.24);
+}
+
+.ocr-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ocr-preview-head strong {
+  color: var(--text-main);
+}
+
+.ocr-preview-head span {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ocr-preview-card p,
+.ocr-preview-card small,
+.ocr-preview-card em {
+  margin-bottom: 0;
+  overflow-wrap: anywhere;
+}
+
+.ocr-preview-card p {
+  color: var(--text-main);
+  font-weight: 800;
+}
+
+.ocr-preview-card small,
+.ocr-preview-card em {
+  color: var(--text-soft);
+  line-height: 1.5;
+  font-style: normal;
 }
 
 .region-item {
@@ -879,5 +1018,13 @@ html.overlay-document #root {
     display: grid;
     align-items: flex-start;
     gap: 10px;
+  }
+
+  .step-panel {
+    padding: 22px;
+  }
+
+  .step-actions {
+    justify-content: flex-start;
   }
 }

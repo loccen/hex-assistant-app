@@ -170,6 +170,24 @@ type AutomationStatus = {
   message: string;
 };
 
+type CalibrationStepId = "prepare-lobby" | "set-display" | "check-layout" | "capture";
+
+type CalibrationStep = {
+  id: CalibrationStepId;
+  title: string;
+  action: string;
+  detail: string;
+};
+
+type NameOcrPreviewSlot = {
+  slot: "left" | "center" | "right";
+  text: string | null;
+  confidence: number | null;
+  lowConfidence: boolean;
+  hint: string | null;
+  source: "placeholder" | "live" | "ocr-check";
+};
+
 const regionDefinitions: RegionDefinition[] = [
   { key: "name-0", label: "左侧符文名称", help: "拖拽框住左侧名称文字", kind: "rect" },
   { key: "name-1", label: "中间符文名称", help: "拖拽框住中间名称文字", kind: "rect" },
@@ -200,6 +218,13 @@ const runtimeStatusAccent: Record<string, string> = {
   paused: "warn",
 };
 
+const calibrationSteps: CalibrationStep[] = [
+  { id: "prepare-lobby", title: "步骤 1", action: "进入一局海克斯乱斗自定义。", detail: "停在海克斯三选一画面。" },
+  { id: "set-display", title: "步骤 2", action: "切到无边框。", detail: "保持这次分辨率和缩放不再变化。" },
+  { id: "check-layout", title: "步骤 3", action: "确认 UI 已完全展开。", detail: "三张海克斯卡和底部按钮都要看得见。" },
+  { id: "capture", title: "步骤 4", action: "选显示器并截图。", detail: "截图完成后直接进入标记工作台。" },
+];
+
 function emptyMarkState(): MarkState {
   return {
     nameRegions: [null, null, null],
@@ -228,9 +253,11 @@ function PlayerApp() {
   const [screenshot, setScreenshot] = useState<ScreenshotDataUrl | null>(null);
   const [marks, setMarks] = useState<MarkState>(() => emptyMarkState());
   const [activeRegion, setActiveRegion] = useState<RegionKey>("name-0");
+  const [calibrationStepIndex, setCalibrationStepIndex] = useState(0);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [ocrReport, setOcrReport] = useState<CalibratedNameOcrReport | null>(null);
+  const [liveNameOcr] = useState<NameOcrPreviewSlot[] | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -407,6 +434,7 @@ function PlayerApp() {
     setScreenshot(null);
     setMarks(emptyMarkState());
     setActiveRegion("name-0");
+    setCalibrationStepIndex(0);
     setOcrReport(null);
     setError(null);
     setToast({ tone: "info", message });
@@ -563,6 +591,7 @@ function PlayerApp() {
     setOcrReport(null);
     setMarks(emptyMarkState());
     setActiveRegion("name-0");
+    setCalibrationStepIndex(calibrationSteps.length - 1);
     const imageData = await runCommand<ScreenshotDataUrl>("screenshot-data", "read_png_file_as_data_url", {
       path: data.pngPath,
     });
@@ -654,6 +683,8 @@ function PlayerApp() {
           marks={marks}
           activeRegion={activeRegion}
           setActiveRegion={setActiveRegion}
+          calibrationStepIndex={calibrationStepIndex}
+          onStepChange={setCalibrationStepIndex}
           setMarks={setMarks}
           completedMarks={completedMarks}
           drag={drag}
@@ -663,6 +694,7 @@ function PlayerApp() {
           readyToCheck={readyToCheck}
           readyToSave={readyToSave}
           ocrReport={ocrReport}
+          nameOcrPreview={mergeNameOcrPreview(liveNameOcr, ocrReport)}
           onRefreshMonitors={loadMonitors}
           onCapture={captureAfterDelay}
           onLoadLatestCapture={loadLatestCapture}
@@ -808,6 +840,8 @@ function CalibrationWizard({
   marks,
   activeRegion,
   setActiveRegion,
+  calibrationStepIndex,
+  onStepChange,
   setMarks,
   completedMarks,
   drag,
@@ -817,6 +851,7 @@ function CalibrationWizard({
   readyToCheck,
   readyToSave,
   ocrReport,
+  nameOcrPreview,
   onRefreshMonitors,
   onCapture,
   onLoadLatestCapture,
@@ -831,6 +866,8 @@ function CalibrationWizard({
   marks: MarkState;
   activeRegion: RegionKey;
   setActiveRegion: (key: RegionKey) => void;
+  calibrationStepIndex: number;
+  onStepChange: (index: number) => void;
   setMarks: (setter: (current: MarkState) => MarkState) => void;
   completedMarks: number;
   drag: DragState | null;
@@ -840,80 +877,108 @@ function CalibrationWizard({
   readyToCheck: boolean;
   readyToSave: boolean;
   ocrReport: CalibratedNameOcrReport | null;
+  nameOcrPreview: NameOcrPreviewSlot[];
   onRefreshMonitors: () => void;
   onCapture: () => void;
   onLoadLatestCapture: () => void;
   onRunOcrCheck: () => void;
   onSave: () => void;
 }) {
-  return (
-    <section className="wizard-grid">
-      <article className="panel guide-panel">
-        <div className="guide-panel-header">
-          <p className="section-kicker">校准向导</p>
-          <h2>先把战场对准，再让助手接管</h2>
-          <p className="guide-lead">
-            这一步不是技术配置，而是为当前分辨率、缩放和游戏 UI 建立一套可靠坐标。做对一次，后面才能少打扰你。
-          </p>
-        </div>
-        <div className="guide-progress">
-          <div className="guide-progress-copy">
-            <span>校准完成度</span>
-            <strong>
-              {completedMarks}/{regionDefinitions.length}
-            </strong>
-          </div>
-          <div className="guide-progress-bar">
-            <span style={{ width: `${(completedMarks / regionDefinitions.length) * 100}%` }} />
-          </div>
-        </div>
-        <ol className="step-list">
-          <li>打开英雄联盟并进入一局海克斯乱斗自定义游戏。</li>
-          <li>将游戏显示模式切到无边框，保持目标分辨率不再变动。</li>
-          <li>选择目标显示器，倒计时截图后立刻切回游戏等待完成。</li>
-          <li>截图完成后，依次标出三槽名称、三张卡片底部和底部展开按钮。</li>
-          <li>先跑一次三槽识别校验，确认文本与落点没有偏移，再保存。</li>
-        </ol>
-        <div className="capture-controls">
-          <label>
-            目标显示器
-            <select
-              value={selectedMonitorId}
-              onChange={(event) => onMonitorChange(event.target.value)}
-              disabled={busy !== null || monitors.length === 0}
-            >
-              <option value="">主显示器</option>
-              {monitors.map((monitor) => (
-                <option key={monitor.id} value={monitor.id}>
-                  {monitor.primary ? "主屏 · " : ""}
-                  {monitor.friendlyName || monitor.name || `显示器 ${monitor.id}`} · {monitor.width}x
-                  {monitor.height}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="button-row">
-            <button type="button" onClick={onRefreshMonitors} disabled={busy !== null}>
-              刷新显示器
-            </button>
-            <button type="button" onClick={onLoadLatestCapture} disabled={busy !== null}>
-              加载最近截图
-            </button>
-            <button type="button" onClick={onCapture} disabled={busy !== null || countdown !== null}>
-              {countdown ? `${countdown} 秒后截图` : "5 秒后截图"}
-            </button>
-          </div>
-        </div>
-      </article>
+  const activeStep = calibrationSteps[calibrationStepIndex] ?? calibrationSteps[0];
+  const isWorkbenchVisible = capture !== null && screenshot !== null;
 
+  if (!isWorkbenchVisible) {
+    return (
+      <section className="wizard-intro">
+        <article className="panel step-panel">
+          <div className="step-panel-header">
+            <p className="section-kicker">校准步骤</p>
+            <span className="step-chip">
+              {calibrationStepIndex + 1}/{calibrationSteps.length}
+            </span>
+          </div>
+          <div className="step-progress-bar" aria-hidden="true">
+            <span style={{ width: `${((calibrationStepIndex + 1) / calibrationSteps.length) * 100}%` }} />
+          </div>
+          <div className="step-panel-copy">
+            <p className="step-title">{activeStep.title}</p>
+            <h2>{activeStep.action}</h2>
+            <p className="guide-lead">{activeStep.detail}</p>
+          </div>
+          {activeStep.id === "capture" ? (
+            <div className="capture-controls capture-controls-standalone">
+              <label>
+                目标显示器
+                <select
+                  value={selectedMonitorId}
+                  onChange={(event) => onMonitorChange(event.target.value)}
+                  disabled={busy !== null || monitors.length === 0}
+                >
+                  <option value="">主显示器</option>
+                  {monitors.map((monitor) => (
+                    <option key={monitor.id} value={monitor.id}>
+                      {monitor.primary ? "主屏 · " : ""}
+                      {monitor.friendlyName || monitor.name || `显示器 ${monitor.id}`} · {monitor.width}x
+                      {monitor.height}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="button-row">
+                <button type="button" onClick={onRefreshMonitors} disabled={busy !== null}>
+                  刷新显示器
+                </button>
+                <button type="button" onClick={onLoadLatestCapture} disabled={busy !== null}>
+                  加载最近截图
+                </button>
+                <button type="button" onClick={onCapture} disabled={busy !== null || countdown !== null}>
+                  {countdown ? `${countdown} 秒后截图` : "5 秒后截图"}
+                </button>
+              </div>
+            </div>
+          ) : null}
+          <div className="button-row step-actions">
+            <button
+              type="button"
+              onClick={() => onStepChange(Math.max(0, calibrationStepIndex - 1))}
+              disabled={busy !== null || calibrationStepIndex === 0}
+            >
+              上一步
+            </button>
+            {activeStep.id !== "capture" ? (
+              <button
+                type="button"
+                onClick={() => onStepChange(Math.min(calibrationSteps.length - 1, calibrationStepIndex + 1))}
+                disabled={busy !== null}
+              >
+                已完成，下一步
+              </button>
+            ) : null}
+          </div>
+        </article>
+      </section>
+    );
+  }
+
+  return (
+    <section className="workspace-stack">
       <article className="panel marking-panel">
         <div className="marking-header">
           <div>
-            <p className="section-kicker">截图标定</p>
-            <h2>把识别区域和定位锚点钉死在这张截图上</h2>
+            <p className="section-kicker">截图工作台</p>
+            <h2>标出名称区域、底部锚点和按钮区域</h2>
             <p>
-              当前正在编辑：{regionDefinitions.find((item) => item.key === activeRegion)?.label}
+              当前正在编辑：{regionDefinitions.find((item) => item.key === activeRegion)?.label} · 已完成{" "}
+              {completedMarks}/{regionDefinitions.length}
             </p>
+          </div>
+          <div className="button-row">
+            <button type="button" onClick={onLoadLatestCapture} disabled={busy !== null}>
+              重新加载截图
+            </button>
+            <button type="button" onClick={onCapture} disabled={busy !== null || countdown !== null}>
+              {countdown ? `${countdown} 秒后截图` : "重新截图"}
+            </button>
           </div>
         </div>
         <div className="marking-layout">
@@ -930,6 +995,7 @@ function CalibrationWizard({
             marks={marks}
             activeRegion={activeRegion}
             setActiveRegion={setActiveRegion}
+            nameOcrPreview={nameOcrPreview}
             onClear={() => {
               setMarks(() => emptyMarkState());
               setActiveRegion("name-0");
@@ -1123,11 +1189,13 @@ function RegionList({
   marks,
   activeRegion,
   setActiveRegion,
+  nameOcrPreview,
   onClear,
 }: {
   marks: MarkState;
   activeRegion: RegionKey;
   setActiveRegion: (key: RegionKey) => void;
+  nameOcrPreview: NameOcrPreviewSlot[];
   onClear: () => void;
 }) {
   return (
@@ -1137,6 +1205,21 @@ function RegionList({
         <button type="button" onClick={onClear}>
           清空标记
         </button>
+      </div>
+      <div className="ocr-preview-list">
+        {nameOcrPreview.map((slot) => (
+          <article key={slot.slot} className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""}`}>
+            <div className="ocr-preview-head">
+              <strong>{slotText[slot.slot]}</strong>
+              <span>{slot.source === "live" ? "实时 OCR" : slot.source === "ocr-check" ? "校验结果" : "待接线"}</span>
+            </div>
+            <p>{slot.text ?? "等待名称 OCR 结果"}</p>
+            <small>
+              {slot.confidence === null ? "置信度待返回" : `置信度 ${(slot.confidence * 100).toFixed(0)}%`}
+            </small>
+            <em>{slot.hint ?? (slot.lowConfidence ? "低置信度，请复核名称框范围。" : "结果稳定后会在这里给出提示。")}</em>
+          </article>
+        ))}
       </div>
       <div className="region-list">
         {regionDefinitions.map((definition) => {
@@ -1159,6 +1242,33 @@ function RegionList({
       </div>
     </aside>
   );
+}
+
+function mergeNameOcrPreview(
+  liveNameOcr: NameOcrPreviewSlot[] | null,
+  ocrReport: CalibratedNameOcrReport | null,
+): NameOcrPreviewSlot[] {
+  if (liveNameOcr && liveNameOcr.length > 0) {
+    return liveNameOcr;
+  }
+  if (ocrReport) {
+    return ocrReport.slots.map((slot) => ({
+      slot: slot.slot,
+      text: slot.finalName ?? (slot.rawText || null),
+      confidence: slot.confidence,
+      lowConfidence: slot.confidence < 0.75 || Boolean(slot.failureReason),
+      hint: slot.failureReason ?? (slot.confidence < 0.75 ? "置信度偏低，请复核名称框。" : "名称区域可用于后续实时展示。"),
+      source: "ocr-check",
+    }));
+  }
+  return (["left", "center", "right"] as const).map((slot) => ({
+    slot,
+    text: null,
+    confidence: null,
+    lowConfidence: false,
+    hint: "预留给即时 OCR 与低置信度提示。",
+    source: "placeholder",
+  }));
 }
 
 function OverlayPage() {
