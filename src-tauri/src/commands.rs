@@ -1,6 +1,6 @@
 use crate::apex::{self, ApexCacheReport, ApexLookupRequest, ApexLookupResult};
 use crate::calibration::{
-    self, CalibrationConfig, CalibrationProfileResult, PixelCalibrationInput,
+    self, CalibrationConfig, CalibrationProfileResult, PixelCalibrationInput, PixelRect,
 };
 use crate::capture::{self, CaptureSampleReport, MonitorDiagnostic};
 use crate::diagnostics;
@@ -9,8 +9,8 @@ use crate::models::{
     DiagnosticExportResult, HealthCheckReport, RuntimeOverview, TelemetryEvent, TelemetryEventInput,
 };
 use crate::ocr::{
-    self, CalibratedNameOcrReport, CalibratedNameSlot, OfflineReplayReport, SlotReplayInput,
-    AUGMENT_DICTIONARY_ZH_CN,
+    self, CalibratedNameOcrReport, CalibratedNameSlot, NameRegionOcrPrecheckReport,
+    OfflineReplayReport, SlotReplayInput, AUGMENT_DICTIONARY_ZH_CN,
 };
 use crate::orchestrator::{RuntimeLoopSnapshot, RuntimeOrchestratorHandle, RuntimeTriggerRequest};
 use crate::overlay::{
@@ -201,6 +201,13 @@ pub struct CalibratedNameOcrCommandInput {
     pub preferred_monitor_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NameRegionOcrPrecheckCommandInput {
+    pub screenshot_path: std::path::PathBuf,
+    pub name_region: PixelRect,
+}
+
 #[cfg(not(test))]
 #[tauri::command]
 pub async fn run_calibrated_name_ocr(
@@ -321,6 +328,58 @@ pub async fn run_pixel_calibrated_name_ocr(
         &paths,
         &trace_id,
         "run_pixel_calibrated_name_ocr",
+        start,
+        join_result,
+    )
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+pub async fn run_name_region_ocr_precheck(
+    app: AppHandle,
+    input: NameRegionOcrPrecheckCommandInput,
+) -> Result<NameRegionOcrPrecheckReport, String> {
+    let paths = AppPaths::from_app(&app)?;
+    paths.ensure_all()?;
+    let settings = load_or_create_settings(&paths)?;
+    let screenshot_summary = input.screenshot_path.display().to_string();
+    let trace_id = telemetry::new_trace_id("ocr-precheck");
+    write_ocr_telemetry(
+        &paths,
+        &trace_id,
+        "info",
+        None,
+        "ocr-precheck-start",
+        format!(
+            "开始执行单区域 OCR 预检 command=run_name_region_ocr_precheck screenshot={screenshot_summary}"
+        ),
+        format!(
+            "等待后台线程处理名称区域 x={} y={} width={} height={}",
+            input.name_region.x, input.name_region.y, input.name_region.width, input.name_region.height
+        ),
+        0,
+    );
+    let resource_root = resource_paths::resource_root(&app);
+    let paths_for_task = paths.clone();
+    let trace_id_for_task = trace_id.clone();
+    let start = Instant::now();
+    let join_result = tauri::async_runtime::spawn_blocking(move || {
+        run_name_region_ocr_precheck_task(
+            &paths_for_task,
+            &trace_id_for_task,
+            resource_root,
+            input.screenshot_path,
+            input.name_region,
+            settings.ocr.min_confidence,
+            settings.ocr.min_match_score,
+        )
+    })
+    .await;
+
+    finalize_name_region_precheck_telemetry(
+        &paths,
+        &trace_id,
+        "run_name_region_ocr_precheck",
         start,
         join_result,
     )
@@ -512,6 +571,190 @@ pub(crate) fn run_calibrated_ocr_task(
     Ok(report)
 }
 
+#[cfg(not(test))]
+fn run_name_region_ocr_precheck_task(
+    paths: &AppPaths,
+    trace_id: &str,
+    resource_root: PathBuf,
+    screenshot_path: PathBuf,
+    name_region: PixelRect,
+    min_confidence: f32,
+    min_match_score: f32,
+) -> Result<NameRegionOcrPrecheckReport, String> {
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-resource-check-start",
+        format!("开始检查 OCR 资源 root={}", resource_root.display()),
+        "准备校验资源目录并按需镜像网络路径资源".to_string(),
+    );
+    let prepared = resource_paths::prepare_runtime_resource_root(&resource_root, &paths.cache)?;
+    let resource_status = ocr::check_ppocr_resources(&prepared.runtime_root);
+    if !resource_status.ready {
+        return Err(resource_status.message);
+    }
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-resource-check-success",
+        format!(
+            "OCR 资源检查完成 source={} runtime={} mirrored={} cache_hit={}",
+            prepared.source_root.display(),
+            prepared.runtime_root.display(),
+            prepared.mirrored_from_network,
+            prepared.cache_hit
+        ),
+        resource_status.message.clone(),
+    );
+
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-dictionary-load-start",
+        "开始加载 OCR 词库".to_string(),
+        "准备读取海克斯词库".to_string(),
+    );
+    let settings = load_or_create_settings(paths)?;
+    let (dictionary, dictionary_summary) =
+        load_runtime_augment_dictionary(paths, &settings, &prepared.runtime_root)?;
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-dictionary-load-success",
+        dictionary_summary,
+        "海克斯词库加载成功".to_string(),
+    );
+
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-ort-init-start",
+        format!(
+            "开始初始化 ONNX Runtime 动态库 root={}",
+            prepared.runtime_root.display()
+        ),
+        "准备显式加载 onnxruntime 动态库".to_string(),
+    );
+    let ort_report = ocr::ensure_ort_runtime_loaded(&prepared.runtime_root)
+        .map_err(|error| error.to_string())?;
+    let ort_stage = if ort_report.cold_start {
+        "ocr-ort-init-success"
+    } else {
+        "ocr-ort-reuse-hit"
+    };
+    let ort_message = if ort_report.cold_start {
+        format!(
+            "ONNX Runtime 动态库冷启动完成 path={} cold_start_ms={}",
+            ort_report.dylib_path.display(),
+            ort_report.elapsed_ms
+        )
+    } else {
+        format!(
+            "ONNX Runtime 动态库复用命中 path={} reuse_hit_ms={}",
+            ort_report.dylib_path.display(),
+            ort_report.elapsed_ms
+        )
+    };
+    log_ocr_stage(
+        paths,
+        trace_id,
+        ort_stage,
+        format!(
+            "ONNX Runtime 动态库可用 path={}",
+            ort_report.dylib_path.display()
+        ),
+        ort_message,
+    );
+
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-recognizer-init-start",
+        format!(
+            "开始初始化 OCR 识别器 resource_root={}",
+            prepared.runtime_root.display()
+        ),
+        "准备创建 ORT 会话并加载模型".to_string(),
+    );
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-inference-start",
+        format!(
+            "开始执行单区域 OCR 预检 screenshot={} report_dir={}",
+            screenshot_path.display(),
+            paths.reports.display()
+        ),
+        format!(
+            "准备裁剪单个名称区域 x={} y={} width={} height={}",
+            name_region.x, name_region.y, name_region.width, name_region.height
+        ),
+    );
+    let inference_start = Instant::now();
+    let (report, recognizer_report) =
+        ocr::with_cached_ppocr_recognizer(&prepared.runtime_root, |recognizer| {
+            ocr::recognize_name_region_precheck_from_image(
+                recognizer,
+                &dictionary,
+                &screenshot_path,
+                name_region,
+                &paths.reports,
+                min_confidence,
+                min_match_score,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    let recognizer_stage = if recognizer_report.cold_start {
+        "ocr-recognizer-init-success"
+    } else {
+        "ocr-recognizer-reuse-hit"
+    };
+    let recognizer_message = if recognizer_report.cold_start {
+        format!(
+            "OCR 识别器冷启动完成 model={} cold_start_ms={}",
+            recognizer_report.model_path.display(),
+            recognizer_report.elapsed_ms
+        )
+    } else {
+        format!(
+            "OCR 识别器复用命中 model={} reuse_hit_ms={}",
+            recognizer_report.model_path.display(),
+            recognizer_report.elapsed_ms
+        )
+    };
+    log_ocr_stage(
+        paths,
+        trace_id,
+        recognizer_stage,
+        format!(
+            "OCR 识别器可用 resource_root={}",
+            recognizer_report.resource_root.display()
+        ),
+        recognizer_message,
+    );
+    log_ocr_stage(
+        paths,
+        trace_id,
+        "ocr-inference-finish",
+        format!(
+            "单区域 OCR 预检完成 screenshot={} report={}",
+            screenshot_path.display(),
+            report.report_path.display()
+        ),
+        format!(
+            "识别完成 final_name={} raw_text={} inference_ms={}",
+            report
+                .final_name
+                .clone()
+                .unwrap_or_else(|| "未命中".to_string()),
+            report.raw_text.clone(),
+            inference_start.elapsed().as_millis()
+        ),
+    );
+
+    Ok(report)
+}
+
 pub(crate) fn load_runtime_augment_dictionary(
     paths: &AppPaths,
     settings: &crate::models::AppSettings,
@@ -580,6 +823,15 @@ pub async fn run_pixel_calibrated_name_ocr(
     _input: PixelCalibrationInput,
     _screenshot_path: std::path::PathBuf,
 ) -> Result<CalibratedNameOcrReport, String> {
+    Err("HEX-OCR-TEST-STUB: Tauri 命令测试编译不执行 OCR 运行时路径".to_string())
+}
+
+#[cfg(test)]
+#[tauri::command]
+pub async fn run_name_region_ocr_precheck(
+    _app: AppHandle,
+    _input: NameRegionOcrPrecheckCommandInput,
+) -> Result<NameRegionOcrPrecheckReport, String> {
     Err("HEX-OCR-TEST-STUB: Tauri 命令测试编译不执行 OCR 运行时路径".to_string())
 }
 
@@ -754,6 +1006,66 @@ fn finalize_ocr_telemetry(
                 Some("HEX-OCR-CHECK-JOIN"),
                 "ocr-check-failed",
                 format!("OCR 校验线程失败 command={command_name}"),
+                message.clone(),
+                duration_ms,
+            );
+            Err(message)
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn finalize_name_region_precheck_telemetry(
+    paths: &AppPaths,
+    trace_id: &str,
+    command_name: &str,
+    start: Instant,
+    join_result: Result<Result<NameRegionOcrPrecheckReport, String>, tauri::Error>,
+) -> Result<NameRegionOcrPrecheckReport, String> {
+    let duration_ms = start.elapsed().as_millis();
+    match join_result {
+        Ok(Ok(report)) => {
+            let result_summary = report
+                .final_name
+                .clone()
+                .unwrap_or_else(|| report.raw_text.clone());
+            write_ocr_telemetry(
+                paths,
+                trace_id,
+                "info",
+                None,
+                "ocr-precheck-success",
+                format!("单区域 OCR 预检完成 command={command_name}"),
+                format!(
+                    "识别完成，result={result_summary} confidence={:.3} match_score={:.3} requires_adjustment={}",
+                    report.confidence, report.match_score, report.requires_user_adjustment
+                ),
+                duration_ms,
+            );
+            Ok(report)
+        }
+        Ok(Err(error)) => {
+            write_ocr_telemetry(
+                paths,
+                trace_id,
+                "error",
+                Some("HEX-OCR-PRECHECK-FAILED"),
+                "ocr-precheck-failed",
+                format!("单区域 OCR 预检失败 command={command_name}"),
+                error.clone(),
+                duration_ms,
+            );
+            Err(error)
+        }
+        Err(error) => {
+            let message = format!("后台 OCR 预检任务执行失败: {error}");
+            write_ocr_telemetry(
+                paths,
+                trace_id,
+                "error",
+                Some("HEX-OCR-PRECHECK-JOIN"),
+                "ocr-precheck-failed",
+                format!("单区域 OCR 预检线程失败 command={command_name}"),
                 message.clone(),
                 duration_ms,
             );

@@ -633,6 +633,8 @@ pub struct MatchResult {
     pub match_score: f32,
     pub final_name: Option<String>,
     pub augment_id: Option<String>,
+    pub below_confidence_threshold: bool,
+    pub below_match_threshold: bool,
     pub failure_reason: Option<String>,
 }
 
@@ -652,6 +654,8 @@ pub fn match_augment_name(
             match_score: 0.0,
             final_name: None,
             augment_id: None,
+            below_confidence_threshold: false,
+            below_match_threshold: false,
             failure_reason: Some("OCR 原始文本为空".to_string()),
         };
     }
@@ -677,15 +681,19 @@ pub fn match_augment_name(
             match_score: 0.0,
             final_name: None,
             augment_id: None,
+            below_confidence_threshold: false,
+            below_match_threshold: false,
             failure_reason: Some("海克斯词库为空".to_string()),
         };
     };
 
-    let failure_reason = if confidence < min_confidence {
+    let below_confidence_threshold = confidence < min_confidence;
+    let below_match_threshold = !below_confidence_threshold && match_score < min_match_score;
+    let failure_reason = if below_confidence_threshold {
         Some(format!(
             "OCR 置信度 {confidence:.3} 低于阈值 {min_confidence:.3}"
         ))
-    } else if match_score < min_match_score {
+    } else if below_match_threshold {
         Some(format!(
             "词库匹配分 {match_score:.3} 低于阈值 {min_match_score:.3}"
         ))
@@ -699,6 +707,8 @@ pub fn match_augment_name(
         match_score,
         final_name: failure_reason.is_none().then(|| entry.name.clone()),
         augment_id: failure_reason.is_none().then(|| entry.id.clone()),
+        below_confidence_threshold,
+        below_match_threshold,
         failure_reason,
     }
 }
@@ -786,6 +796,34 @@ pub struct CalibratedNameOcrSlotReport {
     pub failure_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NameRegionOcrPrecheckReport {
+    pub engine: String,
+    pub created_at: String,
+    pub source_image_path: PathBuf,
+    pub output_dir: PathBuf,
+    pub report_path: PathBuf,
+    pub min_confidence: f32,
+    pub min_match_score: f32,
+    pub crop_rect: PixelRectReport,
+    pub crop_path: PathBuf,
+    pub refined_crop_rect: PixelRectReport,
+    pub refined_crop_path: PathBuf,
+    pub enhanced_path: PathBuf,
+    pub preview_path: PathBuf,
+    pub raw_text: String,
+    pub confidence: f32,
+    pub match_score: f32,
+    pub final_name: Option<String>,
+    pub augment_id: Option<String>,
+    pub below_confidence_threshold: bool,
+    pub below_match_threshold: bool,
+    pub requires_user_adjustment: bool,
+    pub elapsed_ms: u128,
+    pub failure_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PixelRectReport {
@@ -804,6 +842,115 @@ impl From<PixelRect> for PixelRectReport {
             height: rect.height,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct NameRegionRecognitionArtifacts {
+    crop_rect: PixelRect,
+    crop_path: PathBuf,
+    refined_crop_rect: PixelRect,
+    refined_crop_path: PathBuf,
+    enhanced_path: PathBuf,
+    preview_path: PathBuf,
+    matched: MatchResult,
+    elapsed_ms: u128,
+}
+
+fn recognize_name_region(
+    recognizer: &mut PpOcrV4RecRecognizer,
+    dictionary: &AugmentDictionary,
+    image: &DynamicImage,
+    rect: PixelRect,
+    output_dir: Option<&Path>,
+    artifact_prefix: &str,
+    min_confidence: f32,
+    min_match_score: f32,
+) -> OcrResult<NameRegionRecognitionArtifacts> {
+    let slot_start = Instant::now();
+    let crop = image.crop_imm(rect.x, rect.y, rect.width, rect.height);
+    let refined_local_rect = auto_crop_title_band(&crop);
+    let refined_rect = translate_local_rect(rect, refined_local_rect);
+    let refined_crop = crop.crop_imm(
+        refined_local_rect.x,
+        refined_local_rect.y,
+        refined_local_rect.width,
+        refined_local_rect.height,
+    );
+    let preview = annotate_crop_rect(&crop, refined_local_rect);
+    let enhanced = enhance_name_crop(&refined_crop);
+    let crop_path = output_dir
+        .map(|dir| dir.join(format!("{artifact_prefix}-crop.png")))
+        .unwrap_or_default();
+    let refined_crop_path = output_dir
+        .map(|dir| dir.join(format!("{artifact_prefix}-refined-crop.png")))
+        .unwrap_or_default();
+    let enhanced_path = output_dir
+        .map(|dir| dir.join(format!("{artifact_prefix}-enhanced.png")))
+        .unwrap_or_default();
+    let preview_path = output_dir
+        .map(|dir| dir.join(format!("{artifact_prefix}-preview.png")))
+        .unwrap_or_default();
+    if let Some(_) = output_dir {
+        crop.save(&crop_path).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法写入名称区域裁剪图: {error}"),
+                Some(crop_path.clone()),
+            )
+        })?;
+        refined_crop.save(&refined_crop_path).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法写入名称区域精裁图: {error}"),
+                Some(refined_crop_path.clone()),
+            )
+        })?;
+        enhanced.save(&enhanced_path).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法写入名称区域增强图: {error}"),
+                Some(enhanced_path.clone()),
+            )
+        })?;
+        preview.save(&preview_path).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法写入名称区域预览图: {error}"),
+                Some(preview_path.clone()),
+            )
+        })?;
+    }
+
+    let matched = match recognizer.recognize_dynamic(&enhanced) {
+        Ok(recognized) => match_augment_name(
+            dictionary,
+            &recognized.raw_text,
+            recognized.confidence,
+            min_confidence,
+            min_match_score,
+        ),
+        Err(error) => MatchResult {
+            raw_text: String::new(),
+            confidence: 0.0,
+            match_score: 0.0,
+            final_name: None,
+            augment_id: None,
+            below_confidence_threshold: false,
+            below_match_threshold: false,
+            failure_reason: Some(error.to_string()),
+        },
+    };
+
+    Ok(NameRegionRecognitionArtifacts {
+        crop_rect: rect,
+        crop_path,
+        refined_crop_rect: refined_rect,
+        refined_crop_path,
+        enhanced_path,
+        preview_path,
+        matched,
+        elapsed_ms: slot_start.elapsed().as_millis(),
+    })
 }
 
 pub fn recognize_calibrated_name_slots_from_image(
@@ -891,7 +1038,6 @@ pub fn recognize_calibrated_name_slots_from_dynamic_image(
     let mut reports = Vec::with_capacity(CALIBRATED_NAME_SLOT_COUNT);
 
     for (index, slot) in slots.iter().copied().enumerate() {
-        let slot_start = Instant::now();
         let rect = denormalize_rect(calibration.name_regions[index], screenshot_size).map_err(
             |error| {
                 OcrError::new(
@@ -908,96 +1054,31 @@ pub fn recognize_calibrated_name_slots_from_dynamic_image(
                 None,
             )
         })?;
-        let crop = image.crop_imm(rect.x, rect.y, rect.width, rect.height);
-        let refined_local_rect = auto_crop_title_band(&crop);
-        let refined_rect = translate_local_rect(rect, refined_local_rect);
-        let refined_crop = crop.crop_imm(
-            refined_local_rect.x,
-            refined_local_rect.y,
-            refined_local_rect.width,
-            refined_local_rect.height,
-        );
-        let preview = annotate_crop_rect(&crop, refined_local_rect);
-        let enhanced = enhance_name_crop(&refined_crop);
-        let crop_path = output_dir
-            .as_ref()
-            .map(|dir| dir.join(format!("slot-{}-crop.png", slot.as_str())))
-            .unwrap_or_default();
-        let refined_crop_path = output_dir
-            .as_ref()
-            .map(|dir| dir.join(format!("slot-{}-refined-crop.png", slot.as_str())))
-            .unwrap_or_default();
-        let enhanced_path = output_dir
-            .as_ref()
-            .map(|dir| dir.join(format!("slot-{}-enhanced.png", slot.as_str())))
-            .unwrap_or_default();
-        let preview_path = output_dir
-            .as_ref()
-            .map(|dir| dir.join(format!("slot-{}-preview.png", slot.as_str())))
-            .unwrap_or_default();
-        if persist_artifacts {
-            crop.save(&crop_path).map_err(|error| {
-                OcrError::new(
-                    OcrErrorCode::Io,
-                    format!("无法写入 slot 裁剪图: {error}"),
-                    Some(crop_path.clone()),
-                )
-            })?;
-            refined_crop.save(&refined_crop_path).map_err(|error| {
-                OcrError::new(
-                    OcrErrorCode::Io,
-                    format!("无法写入 slot 精裁图: {error}"),
-                    Some(refined_crop_path.clone()),
-                )
-            })?;
-            enhanced.save(&enhanced_path).map_err(|error| {
-                OcrError::new(
-                    OcrErrorCode::Io,
-                    format!("无法写入 slot 增强图: {error}"),
-                    Some(enhanced_path.clone()),
-                )
-            })?;
-            preview.save(&preview_path).map_err(|error| {
-                OcrError::new(
-                    OcrErrorCode::Io,
-                    format!("无法写入 slot 预览图: {error}"),
-                    Some(preview_path.clone()),
-                )
-            })?;
-        }
-
-        let matched = match recognizer.recognize_dynamic(&enhanced) {
-            Ok(recognized) => match_augment_name(
-                dictionary,
-                &recognized.raw_text,
-                recognized.confidence,
-                min_confidence,
-                min_match_score,
-            ),
-            Err(error) => MatchResult {
-                raw_text: String::new(),
-                confidence: 0.0,
-                match_score: 0.0,
-                final_name: None,
-                augment_id: None,
-                failure_reason: Some(error.to_string()),
-            },
-        };
+        let artifacts = recognize_name_region(
+            recognizer,
+            dictionary,
+            image,
+            rect,
+            output_dir.as_deref(),
+            &format!("slot-{}", slot.as_str()),
+            min_confidence,
+            min_match_score,
+        )?;
         reports.push(CalibratedNameOcrSlotReport {
             slot,
-            crop_rect: rect.into(),
-            crop_path,
-            refined_crop_rect: refined_rect.into(),
-            refined_crop_path,
-            enhanced_path,
-            preview_path,
-            raw_text: matched.raw_text,
-            confidence: matched.confidence,
-            match_score: matched.match_score,
-            final_name: matched.final_name,
-            augment_id: matched.augment_id,
-            elapsed_ms: slot_start.elapsed().as_millis(),
-            failure_reason: matched.failure_reason,
+            crop_rect: artifacts.crop_rect.into(),
+            crop_path: artifacts.crop_path,
+            refined_crop_rect: artifacts.refined_crop_rect.into(),
+            refined_crop_path: artifacts.refined_crop_path,
+            enhanced_path: artifacts.enhanced_path,
+            preview_path: artifacts.preview_path,
+            raw_text: artifacts.matched.raw_text,
+            confidence: artifacts.matched.confidence,
+            match_score: artifacts.matched.match_score,
+            final_name: artifacts.matched.final_name,
+            augment_id: artifacts.matched.augment_id,
+            elapsed_ms: artifacts.elapsed_ms,
+            failure_reason: artifacts.matched.failure_reason,
         });
     }
 
@@ -1021,6 +1102,146 @@ pub fn recognize_calibrated_name_slots_from_dynamic_image(
         write_calibrated_name_ocr_report(&report_path, &report)?;
     }
     Ok(report)
+}
+
+pub fn recognize_name_region_precheck_from_image(
+    recognizer: &mut PpOcrV4RecRecognizer,
+    dictionary: &AugmentDictionary,
+    image_path: impl AsRef<Path>,
+    name_region: PixelRect,
+    output_root: impl AsRef<Path>,
+    min_confidence: f32,
+    min_match_score: f32,
+) -> OcrResult<NameRegionOcrPrecheckReport> {
+    let image_path = image_path.as_ref();
+    let image = image::open(image_path).map_err(|error| {
+        OcrError::new(
+            OcrErrorCode::InvalidImage,
+            format!("无法读取 OCR 源图片: {error}"),
+            Some(image_path.to_path_buf()),
+        )
+    })?;
+    recognize_name_region_precheck_from_dynamic_image(
+        recognizer,
+        dictionary,
+        &image,
+        Some(image_path),
+        name_region,
+        output_root,
+        true,
+        min_confidence,
+        min_match_score,
+    )
+}
+
+pub fn recognize_name_region_precheck_from_dynamic_image(
+    recognizer: &mut PpOcrV4RecRecognizer,
+    dictionary: &AugmentDictionary,
+    image: &DynamicImage,
+    source_image_path: Option<&Path>,
+    name_region: PixelRect,
+    output_root: impl AsRef<Path>,
+    persist_artifacts: bool,
+    min_confidence: f32,
+    min_match_score: f32,
+) -> OcrResult<NameRegionOcrPrecheckReport> {
+    if image.width() == 0 || image.height() == 0 {
+        return Err(OcrError::new(
+            OcrErrorCode::InvalidImage,
+            "OCR 源图片宽高不能为 0",
+            source_image_path.map(Path::to_path_buf),
+        ));
+    }
+
+    let total_start = Instant::now();
+    let output_dir = persist_artifacts.then(|| {
+        output_root
+            .as_ref()
+            .join(format!("name-region-precheck-{}", timestamp_for_filename()))
+    });
+    if let Some(output_dir) = &output_dir {
+        fs::create_dir_all(output_dir).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法创建 OCR 预检报告目录: {error}"),
+                Some(output_dir.clone()),
+            )
+        })?;
+    }
+
+    let rect = clamp_pixel_rect(name_region, image.width(), image.height()).ok_or_else(|| {
+        OcrError::new(
+            OcrErrorCode::InvalidImage,
+            "名称区域超出截图范围或裁剪后为空",
+            source_image_path.map(Path::to_path_buf),
+        )
+    })?;
+    let artifacts = recognize_name_region(
+        recognizer,
+        dictionary,
+        image,
+        rect,
+        output_dir.as_deref(),
+        "name-region",
+        min_confidence,
+        min_match_score,
+    )?;
+
+    let report_path = output_dir
+        .as_ref()
+        .map(|dir| dir.join("report.json"))
+        .unwrap_or_default();
+    let report = NameRegionOcrPrecheckReport {
+        engine: "ppocr-v4-rec-onnx".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        source_image_path: source_image_path.map(Path::to_path_buf).unwrap_or_default(),
+        output_dir: output_dir.clone().unwrap_or_default(),
+        report_path: report_path.clone(),
+        min_confidence,
+        min_match_score,
+        crop_rect: artifacts.crop_rect.into(),
+        crop_path: artifacts.crop_path,
+        refined_crop_rect: artifacts.refined_crop_rect.into(),
+        refined_crop_path: artifacts.refined_crop_path,
+        enhanced_path: artifacts.enhanced_path,
+        preview_path: artifacts.preview_path,
+        raw_text: artifacts.matched.raw_text,
+        confidence: artifacts.matched.confidence,
+        match_score: artifacts.matched.match_score,
+        final_name: artifacts.matched.final_name,
+        augment_id: artifacts.matched.augment_id,
+        below_confidence_threshold: artifacts.matched.below_confidence_threshold,
+        below_match_threshold: artifacts.matched.below_match_threshold,
+        requires_user_adjustment: artifacts.matched.failure_reason.is_some(),
+        elapsed_ms: total_start.elapsed().as_millis(),
+        failure_reason: artifacts.matched.failure_reason,
+    };
+    if persist_artifacts {
+        write_name_region_ocr_precheck_report(&report_path, &report)?;
+    }
+    Ok(report)
+}
+
+pub fn write_name_region_ocr_precheck_report(
+    output_path: impl AsRef<Path>,
+    report: &NameRegionOcrPrecheckReport,
+) -> OcrResult<PathBuf> {
+    let output_path = output_path.as_ref();
+    let content = serde_json::to_string_pretty(report).map_err(|error| {
+        OcrError::new(
+            OcrErrorCode::Serialization,
+            format!("无法序列化 OCR 单区域预检报告: {error}"),
+            Some(output_path.to_path_buf()),
+        )
+    })?;
+    fs::write(output_path, format!("{content}\n")).map_err(|error| {
+        OcrError::new(
+            OcrErrorCode::Io,
+            format!("无法写入 OCR 单区域预检报告: {error}"),
+            Some(output_path.to_path_buf()),
+        )
+    })?;
+    Ok(output_path.to_path_buf())
 }
 
 pub fn write_calibrated_name_ocr_report(
@@ -1790,7 +2011,18 @@ mod tests {
     fn dictionary_match_rejects_low_confidence() {
         let matched = match_augment_name(&test_dictionary(), "棱彩门票", 0.2, 0.8, 0.8);
         assert_eq!(matched.final_name, None);
+        assert!(matched.below_confidence_threshold);
+        assert!(!matched.below_match_threshold);
         assert!(matched.failure_reason.unwrap().contains("OCR 置信度"));
+    }
+
+    #[test]
+    fn dictionary_match_marks_low_match_threshold() {
+        let matched = match_augment_name(&test_dictionary(), "完全不相关", 0.95, 0.8, 0.99);
+        assert_eq!(matched.final_name, None);
+        assert!(!matched.below_confidence_threshold);
+        assert!(matched.below_match_threshold);
+        assert!(matched.failure_reason.unwrap().contains("词库匹配分"));
     }
 
     #[test]
