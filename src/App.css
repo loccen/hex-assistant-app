@@ -586,6 +586,8 @@ h2 {
 }
 
 .preview-column {
+  display: grid;
+  gap: 12px;
   min-width: 0;
 }
 
@@ -597,6 +599,32 @@ h2 {
   color: var(--text-dim);
   font-size: 0.8rem;
   overflow-wrap: anywhere;
+}
+
+.preview-toolbar-shell {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(188, 208, 202, 0.14);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.preview-toolbar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.preview-toolbar-head .muted {
+  font-size: 0.84rem;
+}
+
+.region-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .preview-viewport {
@@ -713,29 +741,6 @@ h2 {
   white-space: nowrap;
 }
 
-.region-panel {
-  min-width: 0;
-  display: grid;
-  gap: 12px;
-  padding: 16px;
-  border: 1px solid rgba(188, 208, 202, 0.14);
-  border-radius: 24px;
-  background: rgba(255, 255, 255, 0.03);
-}
-
-.region-actions {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.region-list {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-}
-
 .ocr-preview-list {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -744,10 +749,10 @@ h2 {
 
 .ocr-preview-card {
   display: grid;
-  gap: 6px;
-  padding: 14px;
+  gap: 4px;
+  padding: 12px;
   border: 1px solid rgba(188, 208, 202, 0.14);
-  border-radius: 18px;
+  border-radius: 16px;
   background: rgba(255, 255, 255, 0.03);
 }
 
@@ -797,20 +802,18 @@ h2 {
   font-weight: 800;
 }
 
-.ocr-preview-card small,
-.ocr-preview-card em {
+.ocr-preview-card small {
   color: var(--text-soft);
-  line-height: 1.5;
-  font-style: normal;
+  line-height: 1.35;
 }
 
 .region-item {
   display: grid;
   gap: 8px;
-  width: 100%;
-  min-height: 74px;
-  padding: 14px;
-  border-radius: 20px;
+  flex: 1 1 156px;
+  min-height: 70px;
+  padding: 12px 14px;
+  border-radius: 18px;
   text-align: left;
   background: rgba(255, 255, 255, 0.03);
 }
@@ -990,10 +993,6 @@ html.overlay-document #root {
     grid-column: auto;
   }
 
-  .region-list {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .ocr-preview-list {
     grid-template-columns: 1fr;
   }
@@ -1014,7 +1013,7 @@ html.overlay-document #root {
     justify-content: flex-start;
   }
 
-  .region-actions {
+  .preview-toolbar-head {
     align-items: flex-start;
     flex-direction: column;
   }
@@ -1025,9 +1024,5 @@ html.overlay-document #root {
 
   .step-actions {
     justify-content: flex-start;
-  }
-
-  .region-list {
-    grid-template-columns: 1fr;
   }
 }
