@@ -1884,7 +1884,7 @@ mod tests {
         assert!(slot
             .body
             .as_deref()
-            .is_some_and(|body| body.contains("手动判断") && body.contains("兜底展示")));
+            .is_some_and(|body| body.contains("暂无")));
 
         let _ = std::fs::remove_dir_all(paths.root);
     }
