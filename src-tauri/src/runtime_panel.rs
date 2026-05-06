@@ -46,8 +46,8 @@ pub struct RuntimePanelSnapshotReport {
     pub panel_state: PanelState,
     pub choice_count: usize,
     pub matched_slots: usize,
-    pub source_image_path: PathBuf,
-    pub capture_report_path: PathBuf,
+    pub source_image_path: Option<PathBuf>,
+    pub capture_report_path: Option<PathBuf>,
     pub ocr_report_path: Option<PathBuf>,
     pub dictionary_source: Option<String>,
     pub capture_black_screen: bool,
@@ -70,8 +70,8 @@ struct RuntimePanelUpdate {
     pub captured_at: String,
     pub panel_state: PanelState,
     pub choices: Vec<AugmentChoice>,
-    pub capture_path: PathBuf,
-    pub capture_report_path: PathBuf,
+    pub capture_path: Option<PathBuf>,
+    pub capture_report_path: Option<PathBuf>,
     pub capture_black_screen: bool,
     pub capture_stale_frame: bool,
     pub ocr_report_path: Option<PathBuf>,
@@ -148,20 +148,39 @@ fn capture_runtime_panel(
     settings: &AppSettings,
     trace_id: &str,
 ) -> Result<RuntimePanelUpdate, String> {
+    let diagnostics_enabled = debug_diagnostics_enabled();
     let calibration = calibration::load_calibration_config(&paths.root)?;
     let preferred_monitor_id =
         parse_preferred_monitor_id(settings.capture.preferred_monitor_id.as_deref())?;
-    let capture_report = capture::capture_monitor_sample(&paths.root, preferred_monitor_id)?;
-    let image = image::open(&capture_report.png_path).map_err(|error| {
+    let capture_frame =
+        capture::capture_monitor_frame(&paths.root, preferred_monitor_id, diagnostics_enabled)?;
+    let capture_report = capture_frame.report.clone();
+    let image = DynamicImage::ImageRgba8(capture_frame.image.clone());
+    log_runtime_stage_timing(
+        paths,
+        trace_id,
+        "runtime-panel-screenshot-finish",
         format!(
-            "HEX-RUNTIME-PANEL-IMAGE: 无法读取运行时截图 {}: {error}",
-            capture_report.png_path.display()
-        )
-    })?;
+            "截图显示器={} 尺寸={}x{} 黑屏={} 持久化={}",
+            capture_report.monitor.id,
+            capture_report.image.width,
+            capture_report.image.height,
+            capture_report.image.black_screen,
+            diagnostics_enabled
+        ),
+        format!(
+            "截图分析完成 capture_ms={} save_ms={} stale={}",
+            capture_report.image.capture_duration_ms,
+            capture_report.image.save_duration_ms,
+            capture_report.stale_frame
+        ),
+        capture_report.image.capture_duration_ms + capture_report.image.save_duration_ms,
+    );
     let screenshot_size = ScreenshotSize {
         width: image.width(),
         height: image.height(),
     };
+    let region_analysis_start = Instant::now();
     let button_region = analyze_region(
         &image,
         calibration.bottom_button_region,
@@ -193,9 +212,24 @@ fn capture_runtime_panel(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    log_runtime_stage_timing(
+        paths,
+        trace_id,
+        "runtime-panel-region-analysis-finish",
+        format!(
+            "区域分析按钮可见={} 槽位数={}",
+            button_region.visible,
+            slot_regions.len()
+        ),
+        format!(
+            "区域分析完成 可见槽位={}",
+            slot_regions.iter().filter(|slot| slot.visible).count()
+        ),
+        region_analysis_start.elapsed().as_millis(),
+    );
 
     if capture_report.image.black_screen {
-        return Ok(RuntimePanelUpdate {
+        let update = RuntimePanelUpdate {
             captured_at: capture_report.captured_at,
             panel_state: PanelState::Collapsed,
             choices: Vec::new(),
@@ -208,7 +242,9 @@ fn capture_runtime_panel(
             button_region,
             slot_regions,
             recognized_slot_count: 0,
-        });
+        };
+        write_runtime_panel_diagnostic(paths, trace_id, &update, None)?;
+        return Ok(update);
     }
 
     let should_run_ocr =
@@ -219,8 +255,10 @@ fn capture_runtime_panel(
             trace_id,
             crate::resource_paths::resource_root(app),
             calibration,
-            Some(capture_report.png_path.clone()),
+            &image,
+            capture_report.png_path.as_deref(),
             preferred_monitor_id,
+            diagnostics_enabled,
             settings.ocr.min_confidence,
             settings.ocr.min_match_score,
         )?;
@@ -241,7 +279,9 @@ fn capture_runtime_panel(
         capture_report_path: capture_report.json_path,
         capture_black_screen: false,
         capture_stale_frame: capture_report.stale_frame,
-        ocr_report_path: ocr_report.as_ref().map(|report| report.report_path.clone()),
+        ocr_report_path: ocr_report
+            .as_ref()
+            .and_then(|report| path_if_present(&report.report_path)),
         dictionary_source,
         button_region,
         slot_regions,
@@ -412,8 +452,10 @@ pub(crate) fn run_calibrated_ocr_task(
     trace_id: &str,
     resource_root: PathBuf,
     calibration: CalibrationConfig,
-    screenshot_path: Option<PathBuf>,
+    screenshot_image: &DynamicImage,
+    screenshot_path: Option<&Path>,
     preferred_monitor_id: Option<u32>,
+    persist_artifacts: bool,
     min_confidence: f32,
     min_match_score: f32,
 ) -> Result<(CalibratedNameOcrReport, String), String> {
@@ -452,11 +494,8 @@ pub(crate) fn run_calibrated_ocr_task(
         "开始加载 OCR 词库".to_string(),
         "准备读取海克斯词库".to_string(),
     );
-    let (dictionary, dictionary_source) = crate::commands::load_runtime_augment_dictionary(
-        paths,
-        &settings,
-        &prepared.runtime_root,
-    )?;
+    let (dictionary, dictionary_source) =
+        crate::commands::load_runtime_augment_dictionary(paths, &settings, &prepared.runtime_root)?;
     log_ocr_stage(
         paths,
         trace_id,
@@ -521,7 +560,7 @@ pub(crate) fn run_calibrated_ocr_task(
     );
 
     let screenshot_path = match screenshot_path {
-        Some(path) => path,
+        Some(path) => path.to_path_buf(),
         None => {
             let capture_report =
                 capture::capture_monitor_sample(&paths.root, preferred_monitor_id)?;
@@ -540,12 +579,14 @@ pub(crate) fn run_calibrated_ocr_task(
         "准备裁剪校准区域并执行 OCR 推理".to_string(),
     );
     let inference_start = Instant::now();
-    let report = ocr::recognize_calibrated_name_slots_from_image(
+    let report = ocr::recognize_calibrated_name_slots_from_dynamic_image(
         &mut recognizer,
         &dictionary,
         &calibration,
-        &screenshot_path,
+        screenshot_image,
+        path_if_present(&screenshot_path).as_deref(),
         &paths.reports,
+        persist_artifacts,
         min_confidence,
         min_match_score,
     )
@@ -557,7 +598,7 @@ pub(crate) fn run_calibrated_ocr_task(
         format!(
             "OCR 推理完成 screenshot={} report={}",
             screenshot_path.display(),
-            report.report_path.display()
+            display_optional_path(path_if_present(&report.report_path))
         ),
         format!(
             "识别完成 slot_count={} inference_ms={}",
@@ -575,8 +616,10 @@ pub(crate) fn run_calibrated_ocr_task(
     _trace_id: &str,
     _resource_root: PathBuf,
     _calibration: CalibrationConfig,
-    _screenshot_path: Option<PathBuf>,
+    _screenshot_image: &DynamicImage,
+    _screenshot_path: Option<&Path>,
     _preferred_monitor_id: Option<u32>,
+    _persist_artifacts: bool,
     _min_confidence: f32,
     _min_match_score: f32,
 ) -> Result<(CalibratedNameOcrReport, String), String> {
@@ -633,6 +676,29 @@ fn write_ocr_telemetry(
 }
 
 #[cfg(not(test))]
+fn log_runtime_stage_timing(
+    paths: &AppPaths,
+    trace_id: &str,
+    stage: &str,
+    input_summary: String,
+    message: String,
+    duration_ms: u128,
+) {
+    let event = TelemetryEvent {
+        timestamp: Utc::now().to_rfc3339(),
+        trace_id: trace_id.to_string(),
+        stage: stage.to_string(),
+        input_summary,
+        output_summary: "运行时面板关键阶段耗时".to_string(),
+        duration_ms,
+        level: "info".to_string(),
+        error_code: None,
+        message,
+    };
+    let _ = telemetry::append_event(paths, &event);
+}
+
+#[cfg(not(test))]
 fn write_runtime_panel_diagnostic(
     paths: &AppPaths,
     trace_id: &str,
@@ -642,6 +708,7 @@ fn write_runtime_panel_diagnostic(
     if !debug_diagnostics_enabled() {
         return Ok(());
     }
+    let write_start = Instant::now();
     let diagnostic_path = paths
         .reports
         .join(format!("runtime-panel-diagnostic-{trace_id}.json"));
@@ -680,7 +747,24 @@ fn write_runtime_panel_diagnostic(
         format!("运行时面板诊断已写入 {}", diagnostic_path.display()),
         "已记录截图、区域活动、OCR 原文与失败原因".to_string(),
     );
+    log_runtime_stage_timing(
+        paths,
+        trace_id,
+        "runtime-panel-diagnostic-persist-finish",
+        format!("诊断文件={}", diagnostic_path.display()),
+        "运行时面板诊断文件写入完成".to_string(),
+        write_start.elapsed().as_millis(),
+    );
     Ok(())
+}
+
+fn path_if_present(path: &Path) -> Option<PathBuf> {
+    (!path.as_os_str().is_empty()).then(|| path.to_path_buf())
+}
+
+fn display_optional_path(path: Option<PathBuf>) -> String {
+    path.map(|value| value.display().to_string())
+        .unwrap_or_else(|| "未落盘".to_string())
 }
 
 #[cfg(not(test))]

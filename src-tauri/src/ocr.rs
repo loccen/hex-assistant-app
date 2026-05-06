@@ -686,14 +686,6 @@ pub fn recognize_calibrated_name_slots_from_image(
     min_confidence: f32,
     min_match_score: f32,
 ) -> OcrResult<CalibratedNameOcrReport> {
-    calibration.validate().map_err(|error| {
-        OcrError::new(
-            OcrErrorCode::InvalidCalibration,
-            format!("校准配置无效: {error}"),
-            None,
-        )
-    })?;
-
     let image_path = image_path.as_ref();
     let image = image::open(image_path).map_err(|error| {
         OcrError::new(
@@ -702,26 +694,61 @@ pub fn recognize_calibrated_name_slots_from_image(
             Some(image_path.to_path_buf()),
         )
     })?;
+    recognize_calibrated_name_slots_from_dynamic_image(
+        recognizer,
+        dictionary,
+        calibration,
+        &image,
+        Some(image_path),
+        output_root,
+        true,
+        min_confidence,
+        min_match_score,
+    )
+}
+
+pub fn recognize_calibrated_name_slots_from_dynamic_image(
+    recognizer: &mut PpOcrV4RecRecognizer,
+    dictionary: &AugmentDictionary,
+    calibration: &CalibrationConfig,
+    image: &DynamicImage,
+    source_image_path: Option<&Path>,
+    output_root: impl AsRef<Path>,
+    persist_artifacts: bool,
+    min_confidence: f32,
+    min_match_score: f32,
+) -> OcrResult<CalibratedNameOcrReport> {
+    calibration.validate().map_err(|error| {
+        OcrError::new(
+            OcrErrorCode::InvalidCalibration,
+            format!("校准配置无效: {error}"),
+            None,
+        )
+    })?;
     if image.width() == 0 || image.height() == 0 {
         return Err(OcrError::new(
             OcrErrorCode::InvalidImage,
             "OCR 源图片宽高不能为 0",
-            Some(image_path.to_path_buf()),
+            source_image_path.map(Path::to_path_buf),
         ));
     }
 
     let total_start = Instant::now();
-    let output_dir = output_root.as_ref().join(format!(
-        "calibrated-name-slots-{}",
-        timestamp_for_filename()
-    ));
-    fs::create_dir_all(&output_dir).map_err(|error| {
-        OcrError::new(
-            OcrErrorCode::Io,
-            format!("无法创建 OCR 报告目录: {error}"),
-            Some(output_dir.clone()),
-        )
-    })?;
+    let output_dir = persist_artifacts.then(|| {
+        output_root.as_ref().join(format!(
+            "calibrated-name-slots-{}",
+            timestamp_for_filename()
+        ))
+    });
+    if let Some(output_dir) = &output_dir {
+        fs::create_dir_all(output_dir).map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::Io,
+                format!("无法创建 OCR 报告目录: {error}"),
+                Some(output_dir.clone()),
+            )
+        })?;
+    }
 
     let screenshot_size = ScreenshotSize {
         width: image.width(),
@@ -763,38 +790,52 @@ pub fn recognize_calibrated_name_slots_from_image(
         );
         let preview = annotate_crop_rect(&crop, refined_local_rect);
         let enhanced = enhance_name_crop(&refined_crop);
-        let crop_path = output_dir.join(format!("slot-{}-crop.png", slot.as_str()));
-        let refined_crop_path = output_dir.join(format!("slot-{}-refined-crop.png", slot.as_str()));
-        let enhanced_path = output_dir.join(format!("slot-{}-enhanced.png", slot.as_str()));
-        let preview_path = output_dir.join(format!("slot-{}-preview.png", slot.as_str()));
-        crop.save(&crop_path).map_err(|error| {
-            OcrError::new(
-                OcrErrorCode::Io,
-                format!("无法写入 slot 裁剪图: {error}"),
-                Some(crop_path.clone()),
-            )
-        })?;
-        refined_crop.save(&refined_crop_path).map_err(|error| {
-            OcrError::new(
-                OcrErrorCode::Io,
-                format!("无法写入 slot 精裁图: {error}"),
-                Some(refined_crop_path.clone()),
-            )
-        })?;
-        enhanced.save(&enhanced_path).map_err(|error| {
-            OcrError::new(
-                OcrErrorCode::Io,
-                format!("无法写入 slot 增强图: {error}"),
-                Some(enhanced_path.clone()),
-            )
-        })?;
-        preview.save(&preview_path).map_err(|error| {
-            OcrError::new(
-                OcrErrorCode::Io,
-                format!("无法写入 slot 预览图: {error}"),
-                Some(preview_path.clone()),
-            )
-        })?;
+        let crop_path = output_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("slot-{}-crop.png", slot.as_str())))
+            .unwrap_or_default();
+        let refined_crop_path = output_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("slot-{}-refined-crop.png", slot.as_str())))
+            .unwrap_or_default();
+        let enhanced_path = output_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("slot-{}-enhanced.png", slot.as_str())))
+            .unwrap_or_default();
+        let preview_path = output_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("slot-{}-preview.png", slot.as_str())))
+            .unwrap_or_default();
+        if persist_artifacts {
+            crop.save(&crop_path).map_err(|error| {
+                OcrError::new(
+                    OcrErrorCode::Io,
+                    format!("无法写入 slot 裁剪图: {error}"),
+                    Some(crop_path.clone()),
+                )
+            })?;
+            refined_crop.save(&refined_crop_path).map_err(|error| {
+                OcrError::new(
+                    OcrErrorCode::Io,
+                    format!("无法写入 slot 精裁图: {error}"),
+                    Some(refined_crop_path.clone()),
+                )
+            })?;
+            enhanced.save(&enhanced_path).map_err(|error| {
+                OcrError::new(
+                    OcrErrorCode::Io,
+                    format!("无法写入 slot 增强图: {error}"),
+                    Some(enhanced_path.clone()),
+                )
+            })?;
+            preview.save(&preview_path).map_err(|error| {
+                OcrError::new(
+                    OcrErrorCode::Io,
+                    format!("无法写入 slot 预览图: {error}"),
+                    Some(preview_path.clone()),
+                )
+            })?;
+        }
 
         let matched = match recognizer.recognize_dynamic(&enhanced) {
             Ok(recognized) => match_augment_name(
@@ -831,12 +872,15 @@ pub fn recognize_calibrated_name_slots_from_image(
         });
     }
 
-    let report_path = output_dir.join("report.json");
+    let report_path = output_dir
+        .as_ref()
+        .map(|dir| dir.join("report.json"))
+        .unwrap_or_default();
     let report = CalibratedNameOcrReport {
         engine: "ppocr-v4-rec-onnx".to_string(),
         created_at: Utc::now().to_rfc3339(),
-        source_image_path: image_path.to_path_buf(),
-        output_dir: output_dir.clone(),
+        source_image_path: source_image_path.map(Path::to_path_buf).unwrap_or_default(),
+        output_dir: output_dir.clone().unwrap_or_default(),
         report_path: report_path.clone(),
         slot_count: reports.len(),
         min_confidence,
@@ -844,7 +888,9 @@ pub fn recognize_calibrated_name_slots_from_image(
         elapsed_ms: total_start.elapsed().as_millis(),
         slots: reports,
     };
-    write_calibrated_name_ocr_report(&report_path, &report)?;
+    if persist_artifacts {
+        write_calibrated_name_ocr_report(&report_path, &report)?;
+    }
     Ok(report)
 }
 
