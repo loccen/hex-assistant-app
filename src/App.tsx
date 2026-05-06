@@ -1097,43 +1097,17 @@ function CalibrationWizard({
             setDrag={setDrag}
             setMarks={setMarks}
             setActiveRegion={setActiveRegion}
-            nameOcrPreview={nameOcrPreview}
             onClearMarks={onResetCalibrationMarks}
           />
-        </div>
-      </article>
-
-      <article className="panel check-panel">
-        <div className="panel-heading">
-          <div>
-            <p className="section-kicker">识别校验</p>
-            <h2>先看这次识别像不像玩家会相信的结果</h2>
-          </div>
-          <button type="button" onClick={onRunOcrCheck} disabled={busy !== null || !readyToCheck}>
-            生成校验结果
-          </button>
-        </div>
-        {ocrReport ? (
-          <div className="ocr-grid">
-            {ocrReport.slots.map((slot) => (
-              <div key={slot.slot} className={slot.finalName ? "ocr-card pass" : "ocr-card warn"}>
-                <strong>{slotText[slot.slot]}</strong>
-                <span>{slot.finalName ?? "未确认"}</span>
-                <small>
-                  原文：{slot.rawText || "-"}；置信度 {slot.confidence.toFixed(2)}；匹配{" "}
-                  {slot.matchScore.toFixed(2)}
-                  {slot.failureReason ? `；${slot.failureReason}` : ""}
-                </small>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="muted">完成 7 个标记后生成校验结果，确认三槽名称区域和底部定位正确。</p>
-        )}
-        <div className="button-row final-row">
-          <button type="button" onClick={onSave} disabled={busy !== null || !readyToSave}>
-            确认并保存配置
-          </button>
+          <CalibrationSidebar
+            nameOcrPreview={nameOcrPreview}
+            ocrReport={ocrReport}
+            busy={busy}
+            readyToCheck={readyToCheck}
+            readyToSave={readyToSave}
+            onRunOcrCheck={onRunOcrCheck}
+            onSave={onSave}
+          />
         </div>
       </article>
     </section>
@@ -1149,7 +1123,6 @@ function ScreenshotPreview({
   setDrag,
   setMarks,
   setActiveRegion,
-  nameOcrPreview,
   onClearMarks,
 }: {
   screenshot: ScreenshotDataUrl | null;
@@ -1160,7 +1133,6 @@ function ScreenshotPreview({
   setDrag: (drag: DragState | null) => void;
   setMarks: (setter: (current: MarkState) => MarkState) => void;
   setActiveRegion: (key: RegionKey) => void;
-  nameOcrPreview: NameOcrPreviewSlot[];
   onClearMarks: () => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -1296,22 +1268,86 @@ function ScreenshotPreview({
           ))}
         </div>
       </div>
-      <div className="ocr-preview-list">
-        {nameOcrPreview.map((slot) => (
-          <article
-            key={slot.slot}
-            className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""} ${slot.status === "pending" ? "pending" : ""} ${slot.status === "error" ? "error" : ""}`}
-          >
-            <div className="ocr-preview-head">
-              <strong>{slotText[slot.slot]}</strong>
-              <span>{slot.source === "ocr-check" ? "校验" : "实时 OCR"}</span>
-            </div>
-            <p>{slot.status === "pending" ? "正在预检..." : slot.text ?? "等待名称结果"}</p>
-            <small>{slot.status === "pending" ? "框选后自动触发" : formatNameOcrMetrics(slot)}</small>
-          </article>
-        ))}
-      </div>
     </div>
+  );
+}
+
+function CalibrationSidebar({
+  nameOcrPreview,
+  ocrReport,
+  busy,
+  readyToCheck,
+  readyToSave,
+  onRunOcrCheck,
+  onSave,
+}: {
+  nameOcrPreview: NameOcrPreviewSlot[];
+  ocrReport: CalibratedNameOcrReport | null;
+  busy: string | null;
+  readyToCheck: boolean;
+  readyToSave: boolean;
+  onRunOcrCheck: () => void;
+  onSave: () => void;
+}) {
+  return (
+    <aside className="calibration-side">
+      <section className="side-block">
+        <div className="side-block-head">
+          <div>
+            <p className="section-kicker">实时 OCR</p>
+            <h2>右侧随时看预检</h2>
+          </div>
+        </div>
+        <div className="ocr-preview-list">
+          {nameOcrPreview.map((slot) => (
+            <article
+              key={slot.slot}
+              className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""} ${slot.status === "pending" ? "pending" : ""} ${slot.status === "error" ? "error" : ""}`}
+            >
+              <div className="ocr-preview-head">
+                <strong>{slotText[slot.slot]}</strong>
+                <span>{slot.source === "ocr-check" ? "校验" : "实时"}</span>
+              </div>
+              <p>{slot.status === "pending" ? "正在预检..." : slot.text ?? "等待名称结果"}</p>
+              <small>{slot.status === "pending" ? "框选后自动触发" : formatNameOcrMetrics(slot)}</small>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="side-block">
+        <div className="side-block-head side-block-head-actions">
+          <div>
+            <p className="section-kicker">识别校验</p>
+            <h2>确认后保存</h2>
+          </div>
+          <button type="button" onClick={onRunOcrCheck} disabled={busy !== null || !readyToCheck}>
+            生成校验结果
+          </button>
+        </div>
+        {ocrReport ? (
+          <div className="ocr-grid ocr-grid-compact">
+            {ocrReport.slots.map((slot) => (
+              <div key={slot.slot} className={slot.finalName ? "ocr-card pass" : "ocr-card warn"}>
+                <strong>{slotText[slot.slot]}</strong>
+                <span>{slot.finalName ?? "未确认"}</span>
+                <small>
+                  原文 {slot.rawText || "-"} · 置信度 {slot.confidence.toFixed(2)} · 匹配 {slot.matchScore.toFixed(2)}
+                  {slot.failureReason ? ` · ${slot.failureReason}` : ""}
+                </small>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">7 个标记完成后生成校验。</p>
+        )}
+        <div className="button-row final-row">
+          <button type="button" onClick={onSave} disabled={busy !== null || !readyToSave}>
+            确认并保存配置
+          </button>
+        </div>
+      </section>
+    </aside>
   );
 }
 
