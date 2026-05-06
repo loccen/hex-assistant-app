@@ -102,6 +102,12 @@ pub struct OverlaySlotData {
     pub augment_id: Option<String>,
     pub rank: Option<String>,
     pub score: Option<String>,
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub tips: Option<Vec<String>>,
+    pub source_label: Option<String>,
+    pub source_detail: Option<String>,
+    pub insight: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -238,6 +244,11 @@ pub struct OverlayCardInfo {
     pub augment_id: Option<String>,
     pub rank: Option<String>,
     pub score: Option<String>,
+    pub summary: Option<String>,
+    pub tips: Option<Vec<String>>,
+    pub source_label: Option<String>,
+    pub source_detail: Option<String>,
+    pub insight: Option<String>,
     pub bounds: OverlayBounds,
     pub source: String,
 }
@@ -368,7 +379,10 @@ pub fn sync_runtime_overlay_inner(
         overlay_debug_log(&paths, "[runtime_sync] existing_window dispatch_start");
         dispatch_overlay_slots(&window, &slots)?;
         overlay_debug_log(&paths, "[runtime_sync] existing_window dispatch_done");
-        overlay_debug_log(&paths, "[runtime_sync] existing_window visibility_check_start");
+        overlay_debug_log(
+            &paths,
+            "[runtime_sync] existing_window visibility_check_start",
+        );
         let was_visible = window.is_visible().map_err(|error| {
             OverlayError::Tauri(format!("HEX-OVERLAY-VISIBILITY-FAILED: {error}"))
         })?;
@@ -887,6 +901,11 @@ fn plan_overlay_cards(
                 augment_id: slot_payload.and_then(|payload| payload.augment_id.clone()),
                 rank: slot_payload.and_then(|payload| payload.rank.clone()),
                 score: slot_payload.and_then(|payload| payload.score.clone()),
+                summary: slot_payload.and_then(|payload| payload.summary.clone()),
+                tips: slot_payload.and_then(|payload| payload.tips.clone()),
+                source_label: slot_payload.and_then(|payload| payload.source_label.clone()),
+                source_detail: slot_payload.and_then(|payload| payload.source_detail.clone()),
+                insight: slot_payload.and_then(|payload| payload.insight.clone()),
                 bounds,
                 source: source.to_string(),
             })
@@ -1526,6 +1545,11 @@ mod tests {
                 augment_id: Some("prismatic-ticket".to_string()),
                 rank: Some("S".to_string()),
                 score: Some("4.55".to_string()),
+                summary: Some("连胜过渡强势".to_string()),
+                tips: Some(vec!["优先补前排".to_string()]),
+                source_label: Some("ApexLOL".to_string()),
+                source_detail: Some("缓存数据".to_string()),
+                insight: Some("适合经济优势局".to_string()),
             }],
             240,
             110,
@@ -1535,6 +1559,11 @@ mod tests {
 
         assert_eq!(cards[1].title, "棱彩门票");
         assert_eq!(cards[1].rank.as_deref(), Some("S"));
+        assert_eq!(cards[1].summary.as_deref(), Some("连胜过渡强势"));
+        assert_eq!(
+            cards[1].tips.as_ref(),
+            Some(&vec!["优先补前排".to_string()])
+        );
         assert_eq!(cards[0].source, "fallback.staticAnchors");
     }
 }

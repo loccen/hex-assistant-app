@@ -1,3 +1,4 @@
+use crate::apex;
 use crate::app_paths::AppPaths;
 use crate::live_client::{LiveClientDataApi, LiveClientError, ResolvedPlayerSnapshot};
 use crate::models::TelemetryEventInput;
@@ -435,6 +436,7 @@ fn apply_overlay_plan(
 struct RuntimeOrchestrator {
     machine: AssistantStateMachine,
     panel_snapshot: CalibratedPanelSnapshot,
+    overlay_slots: Vec<OverlaySlotData>,
     recent_events: VecDeque<RuntimeStructuredEvent>,
     last_error_code: Option<String>,
 }
@@ -451,11 +453,21 @@ enum RuntimeOverlayPlan {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeOverlayResolvedChoice {
+    slot: u8,
+    raw_name: String,
+    title: String,
+    augment_id: Option<String>,
+    lookup_name: String,
+}
+
 impl RuntimeOrchestrator {
     fn new() -> Self {
         Self {
             machine: AssistantStateMachine::new(),
             panel_snapshot: CalibratedPanelSnapshot::default(),
+            overlay_slots: Vec::new(),
             recent_events: VecDeque::new(),
             last_error_code: None,
         }
@@ -585,6 +597,7 @@ impl RuntimeOrchestrator {
         };
         let state_events = self.machine.apply(input);
         self.last_error_code = error_code.clone();
+        self.refresh_overlay_slots(paths);
         let overlay_plan = self.build_overlay_plan();
         self.record_overlay_trigger(
             paths,
@@ -802,6 +815,48 @@ impl RuntimeOrchestrator {
         Ok(())
     }
 
+    fn refresh_overlay_slots(&mut self, paths: &AppPaths) {
+        let state = self.machine.state();
+        if state.pause_reason.is_some()
+            || self.panel_snapshot.panel_state != PanelState::Expanded
+            || state.pending_tiers.is_empty()
+            || state.pending_tier.is_none()
+            || state.visible_choices.is_empty()
+        {
+            self.overlay_slots.clear();
+            return;
+        }
+
+        let Some(player) = state.player.as_ref() else {
+            self.overlay_slots.clear();
+            return;
+        };
+        let champion_name = player.champion_name.clone();
+        let pending_tier = state.pending_tier.unwrap_or_default();
+        let visible_choices = state
+            .visible_choices
+            .iter()
+            .map(|(slot, raw_name)| (*slot, raw_name.clone()))
+            .collect::<Vec<_>>();
+        let _ = state;
+
+        let settings = load_or_create_settings(paths).unwrap_or_default();
+        let dictionary = load_overlay_augment_dictionary(paths, &settings);
+        self.overlay_slots = visible_choices
+            .iter()
+            .map(|(slot, raw_name)| {
+                let resolved_choice = resolve_overlay_choice(*slot, raw_name, dictionary.as_ref());
+                build_overlay_slot_data(
+                    paths,
+                    &settings,
+                    &champion_name,
+                    pending_tier,
+                    resolved_choice,
+                )
+            })
+            .collect();
+    }
+
     fn build_overlay_plan(&self) -> RuntimeOverlayPlan {
         let state = self.machine.state();
         if let Some(reason) = state.pause_reason.as_ref() {
@@ -824,29 +879,16 @@ impl RuntimeOrchestrator {
                 reason: "当前没有可展示的海克斯选项".to_string(),
             };
         }
+        if self.overlay_slots.is_empty() {
+            return RuntimeOverlayPlan::Hide {
+                reason: "Overlay 推荐数据尚未准备完成".to_string(),
+            };
+        }
 
         let pending_tier = state.pending_tier.unwrap_or_default();
-        let champion_name = state
-            .player
-            .as_ref()
-            .map(|player| player.champion_name.as_str())
-            .unwrap_or("当前对局");
         RuntimeOverlayPlan::Show {
             reason: format!("海克斯面板已展开且待处理档位 {pending_tier} 可展示"),
-            slots: state
-                .visible_choices
-                .iter()
-                .map(|(slot, augment_id)| OverlaySlotData {
-                    slot: *slot,
-                    title: augment_id.clone(),
-                    body: Some(format!(
-                        "{champion_name} · 第 {pending_tier} 档海克斯 · 槽位 {slot}"
-                    )),
-                    augment_id: Some(augment_id.clone()),
-                    rank: None,
-                    score: None,
-                })
-                .collect(),
+            slots: self.overlay_slots.clone(),
         }
     }
 
@@ -1174,6 +1216,236 @@ impl RuntimeOrchestrator {
     }
 }
 
+fn load_overlay_augment_dictionary(
+    paths: &AppPaths,
+    settings: &crate::models::AppSettings,
+) -> Option<apex::AugmentDictionary> {
+    apex::load_augment_dictionary_with_cache(&paths.cache, apex_lookup_settings(settings), false)
+        .ok()
+        .map(|sync| sync.dictionary)
+}
+
+fn apex_lookup_settings(settings: &crate::models::AppSettings) -> apex::ApexLookupSettings {
+    apex::ApexLookupSettings {
+        cache_ttl_hours: settings.apex_lol.cache_ttl_hours,
+        request_timeout_ms: settings.apex_lol.request_timeout_ms,
+        failed_cache_ttl_minutes: settings.apex_lol.failed_cache_ttl_minutes,
+    }
+}
+
+fn resolve_overlay_choice(
+    slot: u8,
+    raw_name: &str,
+    dictionary: Option<&apex::AugmentDictionary>,
+) -> RuntimeOverlayResolvedChoice {
+    let normalized_raw_name = normalize_overlay_lookup_text(raw_name);
+    if let Some(entry) = dictionary.and_then(|dictionary| {
+        dictionary.augments.iter().find(|entry| {
+            normalize_overlay_lookup_text(&entry.id) == normalized_raw_name
+                || normalize_overlay_lookup_text(&entry.name) == normalized_raw_name
+                || entry
+                    .aliases
+                    .iter()
+                    .any(|alias| normalize_overlay_lookup_text(alias) == normalized_raw_name)
+        })
+    }) {
+        return RuntimeOverlayResolvedChoice {
+            slot,
+            raw_name: raw_name.to_string(),
+            title: entry.name.clone(),
+            augment_id: Some(entry.id.clone()),
+            lookup_name: entry.name.clone(),
+        };
+    }
+
+    RuntimeOverlayResolvedChoice {
+        slot,
+        raw_name: raw_name.to_string(),
+        title: raw_name.to_string(),
+        augment_id: None,
+        lookup_name: raw_name.to_string(),
+    }
+}
+
+fn normalize_overlay_lookup_text(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '\'' && *ch != '’')
+        .collect()
+}
+
+fn build_overlay_slot_data(
+    paths: &AppPaths,
+    settings: &crate::models::AppSettings,
+    champion_name: &str,
+    pending_tier: u8,
+    choice: RuntimeOverlayResolvedChoice,
+) -> OverlaySlotData {
+    let fallback_augment_id = choice
+        .augment_id
+        .clone()
+        .or_else(|| Some(choice.raw_name.clone()));
+    match apex::lookup_with_cache(
+        &paths.cache,
+        apex::ApexLookupRequest {
+            champion_name: champion_name.to_string(),
+            augment_name: choice.lookup_name.clone(),
+            force_refresh: false,
+        },
+        apex_lookup_settings(settings),
+    ) {
+        Ok(result) if result.status == apex::ApexParseStatus::Ok => {
+            let summary = normalize_overlay_summary(&result.summary);
+            let tips = build_overlay_tips(result.tip.as_deref(), Some(summary.as_str()));
+            let insight = build_success_insight(
+                champion_name,
+                pending_tier,
+                &choice.title,
+                result.rating.as_deref(),
+            );
+            OverlaySlotData {
+                slot: choice.slot,
+                title: choice.title,
+                body: Some(build_overlay_body(&summary, &tips, Some(insight.as_str()))),
+                augment_id: fallback_augment_id,
+                rank: normalize_overlay_text_option(result.rating.as_deref()),
+                score: None,
+                summary: Some(summary),
+                tips: (!tips.is_empty()).then_some(tips),
+                source_label: Some(result.source.clone()),
+                source_detail: Some(build_success_source_detail(&result)),
+                insight: Some(insight),
+            }
+        }
+        Ok(result) => build_fallback_overlay_slot_data(
+            champion_name,
+            pending_tier,
+            choice,
+            fallback_augment_id,
+            Some(result.source.clone()),
+            build_failure_source_detail(result.status, result.error.as_deref()),
+        ),
+        Err(error) => build_fallback_overlay_slot_data(
+            champion_name,
+            pending_tier,
+            choice,
+            fallback_augment_id,
+            Some(apex::APEX_SOURCE_NAME.to_string()),
+            format!("查询失败：{}", shrink_error_message(&error)),
+        ),
+    }
+}
+
+fn build_fallback_overlay_slot_data(
+    champion_name: &str,
+    pending_tier: u8,
+    choice: RuntimeOverlayResolvedChoice,
+    augment_id: Option<String>,
+    source_label: Option<String>,
+    source_detail: String,
+) -> OverlaySlotData {
+    let summary = format!("暂无数据：未找到「{}」的联动推荐", choice.title);
+    let tips = vec![format!(
+        "{} 第 {} 档请结合阵容、装备和经济节奏手动判断",
+        champion_name, pending_tier
+    )];
+    let insight = format!("{champion_name} · 第 {pending_tier} 档 · 使用兜底展示");
+    OverlaySlotData {
+        slot: choice.slot,
+        title: choice.title,
+        body: Some(build_overlay_body(&summary, &tips, Some(insight.as_str()))),
+        augment_id,
+        rank: None,
+        score: None,
+        summary: Some(summary),
+        tips: Some(tips),
+        source_label,
+        source_detail: Some(source_detail),
+        insight: Some(insight),
+    }
+}
+
+fn build_overlay_body(summary: &str, tips: &[String], insight: Option<&str>) -> String {
+    let mut parts = vec![format!("摘要：{summary}")];
+    if !tips.is_empty() {
+        parts.push(format!("提醒：{}", tips.join("；")));
+    }
+    if let Some(insight) = insight.map(str::trim).filter(|insight| !insight.is_empty()) {
+        parts.push(format!("结论：{insight}"));
+    }
+    parts.join(" ")
+}
+
+fn build_overlay_tips(tip: Option<&str>, summary: Option<&str>) -> Vec<String> {
+    let summary = summary.and_then(normalize_overlay_text);
+    normalize_overlay_text_option(tip)
+        .filter(|tip| summary.as_ref() != Some(tip))
+        .map(|tip| vec![tip])
+        .unwrap_or_default()
+}
+
+fn build_success_insight(
+    champion_name: &str,
+    pending_tier: u8,
+    augment_name: &str,
+    rating: Option<&str>,
+) -> String {
+    match normalize_overlay_text_option(rating) {
+        Some(rating) => format!(
+            "{champion_name} 第 {pending_tier} 档选择「{augment_name}」的 ApexLOL 评级为 {rating}"
+        ),
+        None => format!("{champion_name} 第 {pending_tier} 档可重点关注「{augment_name}」"),
+    }
+}
+
+fn build_success_source_detail(result: &apex::ApexLookupResult) -> String {
+    let mode = if result.cache_hit {
+        "缓存命中"
+    } else {
+        "实时抓取"
+    };
+    format!("{mode} · {}", result.source_url)
+}
+
+fn build_failure_source_detail(status: apex::ApexParseStatus, error: Option<&str>) -> String {
+    let reason = match status {
+        apex::ApexParseStatus::NoData => "未找到联动数据",
+        apex::ApexParseStatus::RequestFailed => "请求失败",
+        apex::ApexParseStatus::ParseFailed => "页面解析失败",
+        apex::ApexParseStatus::Ok => "已回退到兜底展示",
+    };
+    match error
+        .map(shrink_error_message)
+        .filter(|message| !message.is_empty())
+    {
+        Some(message) => format!("{reason} · {message}"),
+        None => reason.to_string(),
+    }
+}
+
+fn normalize_overlay_summary(summary: &str) -> String {
+    normalize_overlay_text(summary).unwrap_or_else(|| apex::NO_DATA_TEXT.to_string())
+}
+
+fn normalize_overlay_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalize_overlay_text_option(value: Option<&str>) -> Option<String> {
+    value.and_then(normalize_overlay_text)
+}
+
+fn shrink_error_message(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl Default for RuntimeLiveClientContext {
     fn default() -> Self {
         Self {
@@ -1217,6 +1489,8 @@ fn is_allowed_game_mode(game_mode: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1322,6 +1596,41 @@ mod tests {
 
     #[test]
     fn overlay_plan_shows_visible_choices_when_runtime_ready() {
+        let paths = temp_paths("runtime-orchestrator-overlay-plan-ready");
+        paths.ensure_all().expect("应能创建测试目录");
+        seed_augment_dictionary_cache(
+            &paths,
+            vec![
+                apex::AugmentEntry {
+                    id: "prismatic-ticket".to_string(),
+                    name: "棱彩门票".to_string(),
+                    aliases: vec!["Prismatic Ticket".to_string()],
+                },
+                apex::AugmentEntry {
+                    id: "trade-sector".to_string(),
+                    name: "交易扇区".to_string(),
+                    aliases: vec!["Trade Sector".to_string()],
+                },
+            ],
+        );
+        seed_apex_lookup_cache(
+            &paths,
+            "Ahri",
+            "棱彩门票",
+            Some("S".to_string()),
+            "适合连胜经济局。",
+            Some("优先补前排".to_string()),
+            apex::ApexParseStatus::Ok,
+        );
+        seed_apex_lookup_cache(
+            &paths,
+            "Ahri",
+            "交易扇区",
+            None,
+            apex::NO_DATA_TEXT,
+            None,
+            apex::ApexParseStatus::NoData,
+        );
         let mut orchestrator = RuntimeOrchestrator::new();
         orchestrator.machine.apply(StateMachineInput {
             player: Some(LivePlayerSnapshot {
@@ -1356,6 +1665,7 @@ mod tests {
             ],
             selected_slot: None,
         };
+        orchestrator.refresh_overlay_slots(&paths);
 
         let plan = orchestrator.build_overlay_plan();
         match plan {
@@ -1363,22 +1673,51 @@ mod tests {
                 assert!(reason.contains("待处理档位 3"));
                 assert_eq!(slots.len(), 2);
                 assert_eq!(slots[0].slot, 1);
-                assert_eq!(slots[0].title, "prismatic-ticket");
+                assert_eq!(slots[0].title, "棱彩门票");
                 assert_eq!(slots[0].augment_id.as_deref(), Some("prismatic-ticket"));
+                assert_eq!(slots[0].rank.as_deref(), Some("S"));
+                assert_eq!(slots[0].summary.as_deref(), Some("适合连胜经济局。"));
+                assert_eq!(
+                    slots[0].tips.as_ref(),
+                    Some(&vec!["优先补前排".to_string()])
+                );
+                assert_eq!(
+                    slots[0].source_label.as_deref(),
+                    Some(apex::APEX_SOURCE_NAME)
+                );
+                assert!(slots[0]
+                    .source_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("缓存命中")));
                 assert!(slots[0]
                     .body
                     .as_deref()
-                    .is_some_and(|body| body.contains("Ahri")));
+                    .is_some_and(|body| body.contains("结论：Ahri")));
             }
             RuntimeOverlayPlan::Hide { reason } => {
                 panic!("期望生成显示计划，实际隐藏: {reason}");
             }
         }
+
+        let _ = std::fs::remove_dir_all(paths.root);
     }
 
     #[test]
     fn overlay_plan_hides_when_panel_is_collapsed() {
         let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.overlay_slots = vec![OverlaySlotData {
+            slot: 1,
+            title: "棱彩门票".to_string(),
+            body: Some("摘要：适合连胜经济局。".to_string()),
+            augment_id: Some("prismatic-ticket".to_string()),
+            rank: Some("S".to_string()),
+            score: None,
+            summary: Some("适合连胜经济局。".to_string()),
+            tips: Some(vec!["优先补前排".to_string()]),
+            source_label: Some(apex::APEX_SOURCE_NAME.to_string()),
+            source_detail: Some("缓存命中".to_string()),
+            insight: Some("Ahri 第 3 档选择「棱彩门票」的 ApexLOL 评级为 S".to_string()),
+        }];
         orchestrator.machine.apply(StateMachineInput {
             player: Some(LivePlayerSnapshot {
                 champion_name: "Ahri".to_string(),
@@ -1408,6 +1747,208 @@ mod tests {
                 reason: "海克斯面板未展开".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn refresh_overlay_slots_uses_cached_apex_result_and_real_name() {
+        let paths = temp_paths("runtime-orchestrator-overlay-cache-hit");
+        paths.ensure_all().expect("应能创建测试目录");
+        seed_augment_dictionary_cache(
+            &paths,
+            vec![apex::AugmentEntry {
+                id: "prismatic-ticket".to_string(),
+                name: "棱彩门票".to_string(),
+                aliases: vec!["Prismatic Ticket".to_string()],
+            }],
+        );
+        seed_apex_lookup_cache(
+            &paths,
+            "Ahri",
+            "棱彩门票",
+            Some("S".to_string()),
+            "适合连胜经济局。",
+            Some("优先补前排".to_string()),
+            apex::ApexParseStatus::Ok,
+        );
+
+        let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.machine.apply(StateMachineInput {
+            player: Some(LivePlayerSnapshot {
+                champion_name: "Ahri".to_string(),
+                level: 7,
+            }),
+            panel_state: PanelState::Expanded,
+            choices: vec![AugmentChoice {
+                slot: 1,
+                augment_id: "prismatic-ticket".to_string(),
+            }],
+            selected_slot: None,
+            pause_reason: None,
+        });
+        orchestrator.panel_snapshot = CalibratedPanelSnapshot {
+            panel_state: PanelState::Expanded,
+            choices: vec![AugmentChoice {
+                slot: 1,
+                augment_id: "prismatic-ticket".to_string(),
+            }],
+            selected_slot: None,
+        };
+
+        orchestrator.refresh_overlay_slots(&paths);
+
+        assert_eq!(orchestrator.overlay_slots.len(), 1);
+        let slot = &orchestrator.overlay_slots[0];
+        assert_eq!(slot.title, "棱彩门票");
+        assert_eq!(slot.rank.as_deref(), Some("S"));
+        assert_eq!(slot.augment_id.as_deref(), Some("prismatic-ticket"));
+        assert_eq!(slot.summary.as_deref(), Some("适合连胜经济局。"));
+        assert_eq!(slot.source_label.as_deref(), Some(apex::APEX_SOURCE_NAME));
+        assert!(slot
+            .source_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("缓存命中")));
+        assert_eq!(slot.tips.as_ref(), Some(&vec!["优先补前排".to_string()]));
+        assert!(slot
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("提醒：优先补前排")));
+        assert!(slot
+            .insight
+            .as_deref()
+            .is_some_and(|insight| insight.contains("ApexLOL 评级为 S")));
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn refresh_overlay_slots_falls_back_to_no_data_without_faking_rank() {
+        let paths = temp_paths("runtime-orchestrator-overlay-no-data");
+        paths.ensure_all().expect("应能创建测试目录");
+        seed_apex_lookup_cache(
+            &paths,
+            "Ahri",
+            "棱彩门票",
+            None,
+            apex::NO_DATA_TEXT,
+            None,
+            apex::ApexParseStatus::NoData,
+        );
+
+        let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.machine.apply(StateMachineInput {
+            player: Some(LivePlayerSnapshot {
+                champion_name: "Ahri".to_string(),
+                level: 7,
+            }),
+            panel_state: PanelState::Expanded,
+            choices: vec![AugmentChoice {
+                slot: 2,
+                augment_id: "棱彩门票".to_string(),
+            }],
+            selected_slot: None,
+            pause_reason: None,
+        });
+        orchestrator.panel_snapshot = CalibratedPanelSnapshot {
+            panel_state: PanelState::Expanded,
+            choices: vec![AugmentChoice {
+                slot: 2,
+                augment_id: "棱彩门票".to_string(),
+            }],
+            selected_slot: None,
+        };
+
+        orchestrator.refresh_overlay_slots(&paths);
+
+        assert_eq!(orchestrator.overlay_slots.len(), 1);
+        let slot = &orchestrator.overlay_slots[0];
+        assert_eq!(slot.title, "棱彩门票");
+        assert!(slot.rank.is_none());
+        assert!(slot.score.is_none());
+        assert!(slot
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("暂无")));
+        assert_eq!(slot.source_label.as_deref(), Some(apex::APEX_SOURCE_NAME));
+        assert!(slot
+            .source_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("未找到联动数据")));
+        assert!(slot
+            .tips
+            .as_ref()
+            .is_some_and(|tips| tips.iter().any(|tip| tip.contains("手动判断"))));
+        assert!(slot
+            .insight
+            .as_deref()
+            .is_some_and(|insight| insight.contains("兜底展示")));
+        assert!(slot
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("手动判断") && body.contains("兜底展示")));
+
+        let _ = std::fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn refresh_overlay_slots_marks_failed_lookup_as_fallback() {
+        let paths = temp_paths("runtime-orchestrator-overlay-request-failed");
+        paths.ensure_all().expect("应能创建测试目录");
+        seed_apex_lookup_cache(
+            &paths,
+            "Ahri",
+            "交易扇区",
+            None,
+            apex::NO_DATA_TEXT,
+            None,
+            apex::ApexParseStatus::RequestFailed,
+        );
+
+        let mut orchestrator = RuntimeOrchestrator::new();
+        orchestrator.machine.apply(StateMachineInput {
+            player: Some(LivePlayerSnapshot {
+                champion_name: "Ahri".to_string(),
+                level: 7,
+            }),
+            panel_state: PanelState::Expanded,
+            choices: vec![AugmentChoice {
+                slot: 3,
+                augment_id: "交易扇区".to_string(),
+            }],
+            selected_slot: None,
+            pause_reason: None,
+        });
+        orchestrator.panel_snapshot = CalibratedPanelSnapshot {
+            panel_state: PanelState::Expanded,
+            choices: vec![AugmentChoice {
+                slot: 3,
+                augment_id: "交易扇区".to_string(),
+            }],
+            selected_slot: None,
+        };
+
+        orchestrator.refresh_overlay_slots(&paths);
+
+        assert_eq!(orchestrator.overlay_slots.len(), 1);
+        let slot = &orchestrator.overlay_slots[0];
+        assert!(slot
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("暂无")));
+        assert_eq!(slot.source_label.as_deref(), Some(apex::APEX_SOURCE_NAME));
+        assert!(slot
+            .source_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("请求失败")));
+        assert!(slot
+            .tips
+            .as_ref()
+            .is_some_and(|tips| tips.iter().any(|tip| tip.contains("手动判断"))));
+        assert!(slot
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("手动判断") && body.contains("兜底展示")));
+
+        let _ = std::fs::remove_dir_all(paths.root);
     }
 
     #[test]
@@ -1466,5 +2007,71 @@ mod tests {
             cache: root.join("cache"),
             root,
         }
+    }
+
+    fn seed_augment_dictionary_cache(paths: &AppPaths, augments: Vec<apex::AugmentEntry>) {
+        let fetched_at = Utc::now();
+        let cache = apex::ApexAugmentDictionaryCache {
+            version: 1,
+            source: apex::APEX_SOURCE_NAME.to_string(),
+            source_urls: vec!["https://apexlol.info/zh/hextech/".to_string()],
+            fetched_at,
+            expires_at: fetched_at + Duration::hours(1),
+            dictionary: apex::AugmentDictionary {
+                locale: "zh-CN".to_string(),
+                version: 1,
+                augments,
+            },
+        };
+        let path = paths.cache.join("apex-augment-dictionary.zh-CN.json");
+        let content = serde_json::to_string_pretty(&cache).expect("词库缓存应可序列化");
+        std::fs::write(&path, format!("{content}\n")).expect("应能写入词库缓存");
+    }
+
+    fn seed_apex_lookup_cache(
+        paths: &AppPaths,
+        champion_name: &str,
+        augment_name: &str,
+        rating: Option<String>,
+        summary: &str,
+        tip: Option<String>,
+        status: apex::ApexParseStatus,
+    ) {
+        let fetched_at = Utc::now();
+        let entry = apex::ApexCacheEntry {
+            champion_name: champion_name.to_string(),
+            augment_name: augment_name.to_string(),
+            rating,
+            summary: summary.to_string(),
+            tip,
+            source: apex::APEX_SOURCE_NAME.to_string(),
+            source_url: "https://apexlol.info/zh/hextech/77".to_string(),
+            fetched_at,
+            expires_at: fetched_at + Duration::hours(1),
+            cache_hit: false,
+            status,
+            error: None,
+            request_url: "https://apexlol.info/zh/hextech/77".to_string(),
+            duration_ms: 12,
+        };
+        let cache_path = paths.cache.join("apex-cache").join("cache.json");
+        let mut entries = if cache_path.exists() {
+            let content = std::fs::read_to_string(&cache_path).expect("应能读取已有 Apex 缓存");
+            serde_json::from_str::<apex::ApexCacheFile>(&content)
+                .expect("已有 Apex 缓存应可解析")
+                .entries
+        } else {
+            BTreeMap::new()
+        };
+        entries.insert(apex::lookup_cache_key(champion_name, augment_name), entry);
+        let cache = apex::ApexCacheFile {
+            version: 1,
+            entries,
+        };
+        let content = serde_json::to_string_pretty(&cache).expect("Apex 缓存应可序列化");
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent).expect("应能创建 Apex 缓存目录");
+        }
+        std::fs::write(&cache_path, format!("{content}\n")).expect("应能写入 Apex 缓存");
     }
 }

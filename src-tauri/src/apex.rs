@@ -16,7 +16,7 @@ pub const NO_DATA_TEXT: &str = "暂无数据";
 const AUGMENT_DICTIONARY_CACHE_FILE: &str = "apex-augment-dictionary.zh-CN.json";
 
 #[cfg(not(test))]
-use crate::ocr::{AugmentDictionary, AugmentEntry};
+pub use crate::ocr::{AugmentDictionary, AugmentEntry};
 
 #[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +260,12 @@ pub fn build_cache_report(cache_dir: impl AsRef<Path>) -> Result<ApexCacheReport
         expired_entries: entries.iter().filter(|entry| entry.expired).count(),
         entries,
     })
+}
+
+#[cfg(test)]
+#[cfg(test)]
+pub(crate) fn lookup_cache_key(champion_name: &str, augment_name: &str) -> String {
+    cache_key(champion_name, augment_name)
 }
 
 pub fn build_and_write_cache_report(
