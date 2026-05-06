@@ -127,6 +127,11 @@ type OverlaySlotData = {
   augmentId?: string | null;
   rank?: string | null;
   score?: string | null;
+  summary?: string | null;
+  tips?: string[] | null;
+  sourceLabel?: string | null;
+  sourceDetail?: string | null;
+  insight?: string | null;
 };
 
 type OverlayCardInfo = OverlaySlotData & {
@@ -139,6 +144,24 @@ type OverlayPagePayload = {
   generatedAt: string;
   mode: string;
   cards: OverlayCardInfo[];
+};
+
+type OverlayCardViewModel = {
+  slotLabel: string;
+  title: string;
+  summary: string;
+  detail: string | null;
+  insight: string | null;
+  tips: string[];
+  sourceText: string;
+  sourceDetail: string | null;
+  statusText: string;
+  updateText: string;
+  scoreText: string | null;
+  augmentText: string | null;
+  rankText: string | null;
+  rankBadgeText: string;
+  tone: "fallback" | "neutral" | "strong";
 };
 
 type RegionKey =
@@ -1503,12 +1526,12 @@ function formatNameOcrMetrics(slot: NameOcrPreviewSlot): string {
 
 function OverlayPage() {
   const [payload, setPayload] = useState<OverlayPagePayload>(() => {
-    return (
+    return normalizeOverlayPayload(
       window.__HEX_OVERLAY_BOOTSTRAP__ ?? {
         generatedAt: new Date().toISOString(),
         mode: "fallback",
         cards: fallbackOverlayCards(),
-      }
+      },
     );
   });
 
@@ -1520,19 +1543,12 @@ function OverlayPage() {
         ...current,
         generatedAt: new Date().toISOString(),
         mode: "slotData",
-        cards: current.cards.map((card) => {
-          const next = customEvent.detail.find((slot) => slot.slot === card.slot);
-          return next
-            ? {
-                ...card,
-                title: next.title,
-                body: next.body ?? card.body,
-                augmentId: next.augmentId ?? card.augmentId,
-                rank: next.rank ?? card.rank,
-                score: next.score ?? card.score,
-              }
-            : card;
-        }),
+        cards: normalizeOverlayCards(
+          current.cards.map((card) => {
+            const next = customEvent.detail.find((slot) => slot.slot === card.slot);
+            return next ? mergeOverlayCard(card, next) : card;
+          }),
+        ),
       }));
     }
     window.addEventListener("hex-overlay-slots", handleSlotUpdate);
@@ -1543,30 +1559,59 @@ function OverlayPage() {
   }, []);
 
   return (
-    <main className="overlay-root" aria-label="Overlay 测试卡片">
-      {payload.cards.map((card) => (
-        <article
-          key={card.slot}
-          className="overlay-card"
-          style={{
-            left: `${card.bounds.x}px`,
-            top: `${card.bounds.y}px`,
-            width: `${card.bounds.width}px`,
-            height: `${card.bounds.height}px`,
-          }}
-        >
-          <div className="overlay-card-topline">
-            <span>槽位 {card.slot}</span>
-            {card.rank ? <strong>{card.rank}</strong> : null}
-          </div>
-          <h1>{card.title}</h1>
-          <p>{card.body}</p>
-          <footer>
-            <span>{card.score ? `均分 ${card.score}` : payload.mode === "static" ? "静态测试" : "实时数据"}</span>
-            <span>{card.augmentId ?? card.source}</span>
-          </footer>
-        </article>
-      ))}
+    <main className="overlay-root" aria-label="海克斯推荐 Overlay">
+      {payload.cards.map((card) => {
+        const viewModel = buildOverlayCardViewModel(card, payload);
+        return (
+          <article
+            key={card.slot}
+            className="overlay-card"
+            data-mode={payload.mode}
+            data-tone={viewModel.tone}
+            style={{
+              left: `${card.bounds.x}px`,
+              top: `${card.bounds.y}px`,
+              width: `${card.bounds.width}px`,
+              height: `${card.bounds.height}px`,
+            }}
+          >
+            <header className="overlay-card-header">
+              <div className="overlay-card-kicker">
+                <span>{viewModel.slotLabel}</span>
+                <span>{viewModel.statusText}</span>
+              </div>
+            </header>
+            <div className="overlay-card-content">
+              <div className="overlay-card-title-row">
+                <h1>{viewModel.title}</h1>
+                <strong>{viewModel.rankBadgeText}</strong>
+              </div>
+              <p className="overlay-card-summary">{viewModel.summary}</p>
+              {viewModel.detail ? <p className="overlay-card-detail">{viewModel.detail}</p> : null}
+              {viewModel.insight ? <p className="overlay-card-insight">{viewModel.insight}</p> : null}
+            </div>
+            <div className="overlay-card-meta">
+              {viewModel.scoreText ? <span>{viewModel.scoreText}</span> : null}
+              {viewModel.augmentText ? <span>{viewModel.augmentText}</span> : null}
+              {viewModel.rankText ? <span>{viewModel.rankText}</span> : null}
+            </div>
+            {viewModel.tips.length > 0 ? (
+              <div className="overlay-card-tips" aria-label="补充提示">
+                {viewModel.tips.map((tip, index) => (
+                  <span key={`${card.slot}-tip-${index}`}>{tip}</span>
+                ))}
+              </div>
+            ) : null}
+            <footer className="overlay-card-footer">
+              <div className="overlay-card-source">
+                <span>{viewModel.sourceText}</span>
+                {viewModel.sourceDetail ? <small>{viewModel.sourceDetail}</small> : null}
+              </div>
+              <span>{viewModel.updateText}</span>
+            </footer>
+          </article>
+        );
+      })}
     </main>
   );
 }
@@ -1670,19 +1715,173 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function normalizeOverlayPayload(payload: OverlayPagePayload): OverlayPagePayload {
+  return {
+    ...payload,
+    cards: normalizeOverlayCards(payload.cards),
+  };
+}
+
+function normalizeOverlayCards(cards: OverlayCardInfo[]): OverlayCardInfo[] {
+  return cards.map((card) => normalizeOverlayCard(card));
+}
+
+function normalizeOverlayCard(card: OverlayCardInfo): OverlayCardInfo {
+  return {
+    ...card,
+    title: normalizeOverlayText(card.title, `槽位 ${card.slot}`),
+    body: normalizeOverlayText(card.body, "等待推荐摘要"),
+    summary: normalizeOptionalOverlayText(card.summary),
+    tips: normalizeOverlayTips(card.tips),
+    sourceLabel: normalizeOptionalOverlayText(card.sourceLabel),
+    sourceDetail: normalizeOptionalOverlayText(card.sourceDetail),
+    insight: normalizeOptionalOverlayText(card.insight),
+  };
+}
+
+function mergeOverlayCard(card: OverlayCardInfo, next: OverlaySlotData): OverlayCardInfo {
+  return normalizeOverlayCard({
+    ...card,
+    title: next.title,
+    body: next.body ?? card.body,
+    augmentId: next.augmentId ?? card.augmentId,
+    rank: next.rank ?? card.rank,
+    score: next.score ?? card.score,
+    summary: next.summary ?? card.summary,
+    tips: next.tips ?? card.tips,
+    sourceLabel: next.sourceLabel ?? card.sourceLabel,
+    sourceDetail: next.sourceDetail ?? card.sourceDetail,
+    insight: next.insight ?? card.insight,
+  });
+}
+
+function buildOverlayCardViewModel(card: OverlayCardInfo, payload: OverlayPagePayload): OverlayCardViewModel {
+  const summary = card.summary ?? card.body;
+  const detail = card.summary && card.body !== card.summary ? card.body : null;
+  const sourceText = card.sourceLabel ?? formatOverlayModeText(payload.mode, card.source);
+  const rankText = normalizeOptionalOverlayText(card.rank);
+  const tone = resolveOverlayTone(payload.mode, rankText, card.score);
+  return {
+    slotLabel: formatOverlaySlotLabel(card.slot),
+    title: card.title,
+    summary,
+    detail,
+    insight: card.insight ?? null,
+    tips: card.tips ?? [],
+    sourceText,
+    sourceDetail: card.sourceDetail ?? null,
+    statusText: payload.mode === "fallback" ? "等待接线" : "推荐已更新",
+    updateText: formatOverlayUpdateText(payload.generatedAt),
+    scoreText: card.score ? `均分 ${card.score}` : null,
+    augmentText: card.augmentId ? `ID ${card.augmentId}` : null,
+    rankText,
+    rankBadgeText: rankText ?? (payload.mode === "fallback" ? "待评级" : "待补充"),
+    tone,
+  };
+}
+
+function normalizeOverlayText(value: string | null | undefined, fallback: string): string {
+  const text = value?.trim();
+  return text && text.length > 0 ? text : fallback;
+}
+
+function normalizeOptionalOverlayText(value: string | null | undefined): string | null {
+  const text = value?.trim();
+  return text && text.length > 0 ? text : null;
+}
+
+function normalizeOverlayTips(value: string[] | null | undefined): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => item.trim()).filter((item) => item.length > 0).slice(0, 3);
+}
+
+function formatOverlaySlotLabel(slot: number): string {
+  if (slot === 1) {
+    return "左侧候选";
+  }
+  if (slot === 2) {
+    return "中间候选";
+  }
+  if (slot === 3) {
+    return "右侧候选";
+  }
+  return `槽位 ${slot}`;
+}
+
+function formatOverlayModeText(mode: string, source: string): string {
+  if (mode === "fallback") {
+    return "前端兜底";
+  }
+  if (mode === "static") {
+    return "静态预览";
+  }
+  if (mode === "slotData") {
+    return "实时推荐";
+  }
+  return source;
+}
+
+function formatOverlayUpdateText(generatedAt: string): string {
+  const date = new Date(generatedAt);
+  if (Number.isNaN(date.getTime())) {
+    return "更新时间未知";
+  }
+  return `更新 ${date.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  })}`;
+}
+
+function resolveOverlayTone(
+  mode: string,
+  rankText: string | null,
+  scoreText: string | null | undefined,
+): "fallback" | "neutral" | "strong" {
+  if (mode === "fallback") {
+    return "fallback";
+  }
+  const normalizedRank = rankText?.toUpperCase() ?? "";
+  if (normalizedRank.includes("S") || normalizedRank.includes("T0")) {
+    return "strong";
+  }
+  if (normalizedRank.includes("A") || normalizedRank.includes("T1")) {
+    return "strong";
+  }
+  const score = Number.parseFloat(scoreText ?? "");
+  if (!Number.isNaN(score) && score >= 4.2) {
+    return "strong";
+  }
+  return "neutral";
+}
+
 function fallbackOverlayCards(): OverlayCardInfo[] {
   return [1, 2, 3].map((slot, index) => ({
     slot,
-    title: `测试卡片 ${slot}`,
-    body: "Overlay 页面未收到后端初始数据",
+    title: slot === 1 ? "等待左侧推荐" : slot === 2 ? "等待中间推荐" : "等待右侧推荐",
+    body: "当前槽位尚未收到后端推荐，接线完成后会在这里补齐正式说明、来源和操作提示。",
+    summary: "这里会展示海克斯名、评级结论和一眼能看懂的推荐摘要。",
+    insight:
+      slot === 2
+        ? "正式接线后支持逐槽刷新，未更新的卡片会继续保留上一帧稳定展示。"
+        : "如果这张卡暂时没有数据，页面会保留结构和占位，避免 Overlay 在对局内抖动。",
+    tips:
+      slot === 2
+        ? ["保持三张海克斯卡完全展开", "后端未就绪时仍保留卡位", "来源和提示会在接线后自动补齐"]
+        : ["支持后端逐槽更新", "兜底状态也会显示更新时间"],
     augmentId: null,
     rank: null,
     score: null,
+    sourceLabel: "前端兜底",
+    sourceDetail: "等待后端事件推送",
     bounds: {
       x: 80 + index * 280,
       y: 120,
       width: 260,
-      height: 118,
+      height: 210,
     },
     source: "frontend.fallback",
   }));
