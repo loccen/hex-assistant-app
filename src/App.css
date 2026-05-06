@@ -559,13 +559,13 @@ h2 {
     rgba(255, 255, 255, 0.03);
 }
 
-.marking-panel,
-.check-panel {
+.marking-panel {
   grid-column: 1 / -1;
 }
 
 .marking-header,
-.panel-heading {
+.panel-heading,
+.side-block-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -574,7 +574,8 @@ h2 {
 }
 
 .marking-header p,
-.panel-heading p {
+.panel-heading p,
+.side-block-head p {
   margin-bottom: 0;
   color: var(--text-soft);
   line-height: 1.6;
@@ -582,13 +583,41 @@ h2 {
 
 .marking-layout {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
   gap: 14px;
+  align-items: start;
 }
 
 .preview-column {
   display: grid;
   gap: 12px;
   min-width: 0;
+}
+
+.calibration-side {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.side-block {
+  padding: 16px;
+  border: 1px solid rgba(188, 208, 202, 0.14);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.side-block-head {
+  margin-bottom: 12px;
+}
+
+.side-block-head h2 {
+  margin-bottom: 0;
+  font-size: 1.08rem;
+}
+
+.side-block-head-actions {
+  align-items: center;
 }
 
 .preview-meta {
@@ -743,7 +772,7 @@ h2 {
 
 .ocr-preview-list {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 10px;
 }
 
@@ -850,13 +879,17 @@ h2 {
   gap: 12px;
 }
 
+.ocr-grid-compact {
+  grid-template-columns: 1fr;
+}
+
 .ocr-card {
   display: grid;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  padding: 16px;
+  padding: 12px;
   border: 1px solid var(--line-soft);
-  border-radius: 22px;
+  border-radius: 18px;
   background: var(--bg-panel-soft);
 }
 
@@ -874,13 +907,13 @@ h2 {
 
 .ocr-card span {
   color: var(--text-main);
-  font-size: 1.1rem;
+  font-size: 1rem;
   font-weight: 900;
 }
 
 .ocr-card small {
   color: var(--text-soft);
-  line-height: 1.6;
+  line-height: 1.45;
   overflow-wrap: anywhere;
 }
 
@@ -983,6 +1016,7 @@ html.overlay-document #root {
   .topbar,
   .status-hero,
   .wizard-grid,
+  .marking-layout,
   .status-grid,
   .ocr-grid,
   .panel-heading {
@@ -991,6 +1025,10 @@ html.overlay-document #root {
 
   .status-card-wide {
     grid-column: auto;
+  }
+
+  .marking-layout {
+    grid-template-columns: 1fr;
   }
 
   .ocr-preview-list {
