@@ -1088,13 +1088,6 @@ function CalibrationWizard({
           </div>
         </div>
         <div className="marking-layout">
-          <RegionList
-            marks={marks}
-            activeRegion={activeRegion}
-            setActiveRegion={setActiveRegion}
-            nameOcrPreview={nameOcrPreview}
-            onClearMarks={onResetCalibrationMarks}
-          />
           <ScreenshotPreview
             screenshot={screenshot}
             capture={capture}
@@ -1103,6 +1096,9 @@ function CalibrationWizard({
             drag={drag}
             setDrag={setDrag}
             setMarks={setMarks}
+            setActiveRegion={setActiveRegion}
+            nameOcrPreview={nameOcrPreview}
+            onClearMarks={onResetCalibrationMarks}
           />
         </div>
       </article>
@@ -1152,6 +1148,9 @@ function ScreenshotPreview({
   drag,
   setDrag,
   setMarks,
+  setActiveRegion,
+  nameOcrPreview,
+  onClearMarks,
 }: {
   screenshot: ScreenshotDataUrl | null;
   capture: CaptureSampleReport | null;
@@ -1160,6 +1159,9 @@ function ScreenshotPreview({
   drag: DragState | null;
   setDrag: (drag: DragState | null) => void;
   setMarks: (setter: (current: MarkState) => MarkState) => void;
+  setActiveRegion: (key: RegionKey) => void;
+  nameOcrPreview: NameOcrPreviewSlot[];
+  onClearMarks: () => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const width = capture?.image.width ?? 16;
@@ -1221,6 +1223,33 @@ function ScreenshotPreview({
 
   return (
     <div className="preview-column">
+      <div className="preview-toolbar-shell">
+        <div className="preview-toolbar-head">
+          <p className="muted">先选目标，再在截图里框选或落点。</p>
+          <button type="button" onClick={onClearMarks}>
+            清空标记
+          </button>
+        </div>
+        <div className="region-strip">
+          {regionDefinitions.map((definition) => {
+            const value = getRegionValue(marks, definition.key);
+            return (
+              <button
+                key={definition.key}
+                type="button"
+                className={`region-item ${definition.key === activeRegion ? "selected" : ""}`}
+                onClick={() => setActiveRegion(definition.key)}
+              >
+                <span>
+                  <strong>{definition.label}</strong>
+                  <small>{definition.kind === "point" ? "点击落点" : "拖拽框选"}</small>
+                </span>
+                <em>{value ? formatRegionValue(value) : "未标记"}</em>
+              </button>
+            );
+          })}
+        </div>
+      </div>
       <div className="preview-meta">
         <span>{capture ? `截图尺寸：${capture.image.width} x ${capture.image.height}` : "等待截图"}</span>
         <span>{capture ? `截图时间：${capture.capturedAt}` : "完成截图后在这里标记"}</span>
@@ -1267,53 +1296,6 @@ function ScreenshotPreview({
           ))}
         </div>
       </div>
-    </div>
-  );
-}
-
-function RegionList({
-  marks,
-  activeRegion,
-  setActiveRegion,
-  nameOcrPreview,
-  onClearMarks,
-}: {
-  marks: MarkState;
-  activeRegion: RegionKey;
-  setActiveRegion: (key: RegionKey) => void;
-  nameOcrPreview: NameOcrPreviewSlot[];
-  onClearMarks: () => void;
-}) {
-  return (
-    <section className="region-panel">
-      <div className="region-actions">
-        <div>
-          <p className="section-kicker">标记区</p>
-          <p className="muted">先点顶部目标，再到下方截图里框选或落点。</p>
-        </div>
-        <button type="button" onClick={onClearMarks}>
-          清空标记
-        </button>
-      </div>
-      <div className="region-list">
-        {regionDefinitions.map((definition) => {
-          const value = getRegionValue(marks, definition.key);
-          return (
-            <button
-              key={definition.key}
-              type="button"
-              className={`region-item ${definition.key === activeRegion ? "selected" : ""}`}
-              onClick={() => setActiveRegion(definition.key)}
-            >
-              <span>
-                <strong>{definition.label}</strong>
-                <small>{definition.kind === "point" ? "点击落点" : "拖拽框选"}</small>
-              </span>
-              <em>{value ? formatRegionValue(value) : "未标记"}</em>
-            </button>
-          );
-        })}
-      </div>
       <div className="ocr-preview-list">
         {nameOcrPreview.map((slot) => (
           <article
@@ -1326,11 +1308,10 @@ function RegionList({
             </div>
             <p>{slot.status === "pending" ? "正在预检..." : slot.text ?? "等待名称结果"}</p>
             <small>{slot.status === "pending" ? "框选后自动触发" : formatNameOcrMetrics(slot)}</small>
-            <em>{slot.hint ?? (slot.lowConfidence ? "低置信度，请复核。" : "结果会持续更新。")}</em>
           </article>
         ))}
       </div>
-    </section>
+    </div>
   );
 }
 
