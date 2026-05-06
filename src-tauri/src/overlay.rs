@@ -43,6 +43,10 @@ const DEFAULT_CARD_WIDTH: u32 = 260;
 const DEFAULT_CARD_HEIGHT: u32 = 118;
 const DEFAULT_GAP: i32 = 18;
 
+fn debug_diagnostics_enabled() -> bool {
+    cfg!(feature = "debug-diagnostics")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayTestCardRequest {
@@ -1175,6 +1179,9 @@ fn hide_after_error(paths: &AppPaths, window: &WebviewWindow, reason: &str) {
 }
 
 fn overlay_debug_log(paths: &AppPaths, line: &str) {
+    if !debug_diagnostics_enabled() {
+        return;
+    }
     let path = paths.overlay_debug_log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

@@ -7,11 +7,14 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "check:rust": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "check:rust:debug": "cargo check --manifest-path src-tauri/Cargo.toml --features debug-diagnostics",
     "build:windows": "tauri build --target x86_64-pc-windows-gnu",
+    "build:windows:debug": "tauri build --target x86_64-pc-windows-gnu --features debug-diagnostics",
     "build:windows-gnu": "npm run build:windows",
     "release:zip": "cargo run --manifest-path src-tauri/Cargo.toml --example export-release",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:debug-diagnostics": "tauri dev --features debug-diagnostics"
   },
   "dependencies": {
     "react": "^19.1.0",

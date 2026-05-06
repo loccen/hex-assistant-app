@@ -35,6 +35,10 @@ const SLOT_VISIBLE_STDDEV_THRESHOLD: f64 = 16.0;
 const SLOT_VISIBLE_EDGE_THRESHOLD: f64 = 0.12;
 const SLOT_VISIBLE_BRIGHT_THRESHOLD: f64 = 0.035;
 
+fn debug_diagnostics_enabled() -> bool {
+    cfg!(feature = "debug-diagnostics")
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimePanelSnapshotReport {
@@ -610,6 +614,9 @@ fn write_ocr_telemetry(
     message: String,
     duration_ms: u128,
 ) {
+    if !debug_diagnostics_enabled() {
+        return;
+    }
     let event = TelemetryEvent {
         timestamp: Utc::now().to_rfc3339(),
         trace_id: trace_id.to_string(),
@@ -632,6 +639,9 @@ fn write_runtime_panel_diagnostic(
     update: &RuntimePanelUpdate,
     ocr_report: Option<&CalibratedNameOcrReport>,
 ) -> Result<(), String> {
+    if !debug_diagnostics_enabled() {
+        return Ok(());
+    }
     let diagnostic_path = paths
         .reports
         .join(format!("runtime-panel-diagnostic-{trace_id}.json"));
