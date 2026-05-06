@@ -616,8 +616,16 @@ function PlayerApp() {
 
   async function captureAfterDelay() {
     const preferredMonitorId = selectedMonitorId === "" ? null : Number.parseInt(selectedMonitorId, 10);
+    const appWindow = getCurrentWindow();
     setCountdown(5);
-    setToast({ tone: "info", message: "请切回游戏画面，助手将在 5 秒后截图。" });
+    setToast({
+      tone: "info",
+      message: "倒计时已经开始，请立刻切回游戏海克斯三选一画面并保持不动，助手会在 5 秒后自动截图。",
+    });
+    try {
+      await appWindow.hide();
+    } catch {
+    }
     for (let left = 4; left >= 0; left -= 1) {
       await delay(1000);
       setCountdown(left === 0 ? null : left);
@@ -627,17 +635,19 @@ function PlayerApp() {
       preferredMonitorId,
     });
     if (!data) {
+      try {
+        await appWindow.show();
+        await appWindow.setFocus();
+      } catch {
+      }
       return;
     }
     await loadCaptureIntoCalibration(data, "截图完成，可以关闭或离开自定义游戏。");
-  }
-
-  async function loadLatestCapture() {
-    const data = await runCommand<CaptureSampleReport>("latest-capture", "load_latest_capture_sample");
-    if (!data) {
-      return;
+    try {
+      await appWindow.show();
+      await appWindow.setFocus();
+    } catch {
     }
-    await loadCaptureIntoCalibration(data, "已加载最近截图样本，可以直接继续校准。");
   }
 
   async function loadCaptureIntoCalibration(data: CaptureSampleReport, successMessage: string) {
@@ -802,7 +812,6 @@ function PlayerApp() {
           onResetCalibrationMarks={clearCalibrationMarks}
           onRefreshMonitors={loadMonitors}
           onCapture={captureAfterDelay}
-          onLoadLatestCapture={loadLatestCapture}
           onRunOcrCheck={runOcrCheck}
           onSave={saveCalibration}
         />
@@ -960,7 +969,6 @@ function CalibrationWizard({
   onResetCalibrationMarks,
   onRefreshMonitors,
   onCapture,
-  onLoadLatestCapture,
   onRunOcrCheck,
   onSave,
 }: {
@@ -987,7 +995,6 @@ function CalibrationWizard({
   onResetCalibrationMarks: () => void;
   onRefreshMonitors: () => void;
   onCapture: () => void;
-  onLoadLatestCapture: () => void;
   onRunOcrCheck: () => void;
   onSave: () => void;
 }) {
@@ -1035,13 +1042,11 @@ function CalibrationWizard({
                 <button type="button" onClick={onRefreshMonitors} disabled={busy !== null}>
                   刷新显示器
                 </button>
-                <button type="button" onClick={onLoadLatestCapture} disabled={busy !== null}>
-                  加载最近截图
-                </button>
                 <button type="button" onClick={onCapture} disabled={busy !== null || countdown !== null}>
                   {countdown ? `${countdown} 秒后截图` : "5 秒后截图"}
                 </button>
               </div>
+              <p className="muted">点击倒计时截图后会立即隐藏助手窗口，请直接切回游戏等待自动截图。</p>
             </div>
           ) : null}
           <div className="button-row step-actions">
@@ -1074,21 +1079,22 @@ function CalibrationWizard({
           <div>
             <p className="section-kicker">截图工作台</p>
             <h2>标出名称区域、底部锚点和按钮区域</h2>
-            <p>
-              当前正在编辑：{regionDefinitions.find((item) => item.key === activeRegion)?.label} · 已完成{" "}
-              {completedMarks}/{regionDefinitions.length}
-            </p>
+            <p>当前：{regionDefinitions.find((item) => item.key === activeRegion)?.label} · {completedMarks}/7</p>
           </div>
           <div className="button-row">
-            <button type="button" onClick={onLoadLatestCapture} disabled={busy !== null}>
-              重新加载截图
-            </button>
             <button type="button" onClick={onCapture} disabled={busy !== null || countdown !== null}>
               {countdown ? `${countdown} 秒后截图` : "重新截图"}
             </button>
           </div>
         </div>
         <div className="marking-layout">
+          <RegionList
+            marks={marks}
+            activeRegion={activeRegion}
+            setActiveRegion={setActiveRegion}
+            nameOcrPreview={nameOcrPreview}
+            onClearMarks={onResetCalibrationMarks}
+          />
           <ScreenshotPreview
             screenshot={screenshot}
             capture={capture}
@@ -1097,13 +1103,6 @@ function CalibrationWizard({
             drag={drag}
             setDrag={setDrag}
             setMarks={setMarks}
-          />
-          <RegionList
-            marks={marks}
-            activeRegion={activeRegion}
-            setActiveRegion={setActiveRegion}
-            nameOcrPreview={nameOcrPreview}
-            onClearMarks={onResetCalibrationMarks}
           />
         </div>
       </article>
@@ -1166,11 +1165,7 @@ function ScreenshotPreview({
   const width = capture?.image.width ?? 16;
   const height = capture?.image.height ?? 9;
   const activeDefinition = regionDefinitions.find((definition) => definition.key === activeRegion)!;
-  const [zoom, setZoom] = useState(1);
-
-  useEffect(() => {
-    setZoom(1);
-  }, [screenshot?.path]);
+  const previewScale = 0.5;
 
   function pointerToPixel(event: React.PointerEvent<HTMLDivElement>) {
     const bounds = ref.current?.getBoundingClientRect();
@@ -1228,29 +1223,16 @@ function ScreenshotPreview({
     <div className="preview-column">
       <div className="preview-meta">
         <span>{capture ? `截图尺寸：${capture.image.width} x ${capture.image.height}` : "等待截图"}</span>
-        <span>{capture ? `截图时间：${capture.capturedAt}` : "按向导完成自定义游戏画面后截图"}</span>
-      </div>
-      <div className="preview-toolbar">
-        <span>预览缩放 {Math.round(zoom * 100)}%</span>
-        <div className="button-row">
-          <button type="button" onClick={() => setZoom((current) => clamp(Number((current - 0.25).toFixed(2)), 0.5, 3))}>
-            缩小
-          </button>
-          <button type="button" onClick={() => setZoom(1)}>
-            还原
-          </button>
-          <button type="button" onClick={() => setZoom((current) => clamp(Number((current + 0.25).toFixed(2)), 0.5, 3))}>
-            放大
-          </button>
-        </div>
+        <span>{capture ? `截图时间：${capture.capturedAt}` : "完成截图后在这里标记"}</span>
+        <span>预览缩放：50%</span>
       </div>
       <div className="preview-viewport">
         <div
           ref={ref}
           className="screenshot-preview"
           style={{
-            width: `${Math.max(1, Math.round(width * zoom))}px`,
-            height: `${Math.max(1, Math.round(height * zoom))}px`,
+            width: `${Math.max(1, Math.round(width * previewScale))}px`,
+            height: `${Math.max(1, Math.round(height * previewScale))}px`,
           }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
@@ -1303,36 +1285,15 @@ function RegionList({
   onClearMarks: () => void;
 }) {
   return (
-    <aside className="region-panel">
+    <section className="region-panel">
       <div className="region-actions">
-        <p className="section-kicker">标记列表</p>
+        <div>
+          <p className="section-kicker">标记区</p>
+          <p className="muted">先点顶部目标，再到下方截图里框选或落点。</p>
+        </div>
         <button type="button" onClick={onClearMarks}>
           清空标记
         </button>
-      </div>
-      <div className="ocr-preview-list">
-        {nameOcrPreview.map((slot) => (
-          <article
-            key={slot.slot}
-            className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""} ${slot.status === "pending" ? "pending" : ""} ${slot.status === "error" ? "error" : ""}`}
-          >
-            <div className="ocr-preview-head">
-              <strong>{slotText[slot.slot]}</strong>
-              <span>
-                {slot.source === "live" ? "实时 OCR" : slot.source === "ocr-check" ? "校验结果" : "待接线"}
-              </span>
-            </div>
-            <p>
-              {slot.status === "pending" ? "正在预检名称区域..." : slot.text ?? "等待名称 OCR 结果"}
-            </p>
-            <small>
-              {slot.status === "pending"
-                ? "完成框选后自动触发单区域 OCR 预检"
-                : formatNameOcrMetrics(slot)}
-            </small>
-            <em>{slot.hint ?? (slot.lowConfidence ? "低置信度，请复核名称框范围。" : "结果稳定后会在这里给出提示。")}</em>
-          </article>
-        ))}
       </div>
       <div className="region-list">
         {regionDefinitions.map((definition) => {
@@ -1346,14 +1307,30 @@ function RegionList({
             >
               <span>
                 <strong>{definition.label}</strong>
-                <small>{definition.help}</small>
+                <small>{definition.kind === "point" ? "点击落点" : "拖拽框选"}</small>
               </span>
               <em>{value ? formatRegionValue(value) : "未标记"}</em>
             </button>
           );
         })}
       </div>
-    </aside>
+      <div className="ocr-preview-list">
+        {nameOcrPreview.map((slot) => (
+          <article
+            key={slot.slot}
+            className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""} ${slot.status === "pending" ? "pending" : ""} ${slot.status === "error" ? "error" : ""}`}
+          >
+            <div className="ocr-preview-head">
+              <strong>{slotText[slot.slot]}</strong>
+              <span>{slot.source === "ocr-check" ? "校验" : "实时 OCR"}</span>
+            </div>
+            <p>{slot.status === "pending" ? "正在预检..." : slot.text ?? "等待名称结果"}</p>
+            <small>{slot.status === "pending" ? "框选后自动触发" : formatNameOcrMetrics(slot)}</small>
+            <em>{slot.hint ?? (slot.lowConfidence ? "低置信度，请复核。" : "结果会持续更新。")}</em>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
