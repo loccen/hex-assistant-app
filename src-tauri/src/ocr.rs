@@ -12,12 +12,15 @@ use chrono::Utc;
 use image::{imageops, DynamicImage, GrayImage, ImageBuffer, Rgb, RgbImage};
 use ndarray::{Array4, Axis};
 use ort::{
+    init_from as init_ort_from,
     session::{builder::GraphOptimizationLevel, Session},
     value::Tensor,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 pub const PPOCR_V4_REC_MODEL: &str = "ppocrv4_rec.onnx";
@@ -38,6 +41,7 @@ pub enum OcrErrorCode {
     OrtSession,
     Inference,
     Decode,
+    RuntimeCache,
     Io,
     Serialization,
 }
@@ -160,6 +164,131 @@ pub struct PpOcrV4RecRecognizer {
     output_name: String,
     char_list: Vec<String>,
     session: Session,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrtRuntimeLoadReport {
+    pub dylib_path: PathBuf,
+    pub cold_start: bool,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecognizerAcquireReport {
+    pub resource_root: PathBuf,
+    pub model_path: PathBuf,
+    pub cold_start: bool,
+    pub elapsed_ms: u128,
+}
+
+static ORT_RUNTIME_CACHE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static RECOGNIZER_CACHE: OnceLock<Mutex<HashMap<PathBuf, PpOcrV4RecRecognizer>>> = OnceLock::new();
+
+fn ort_runtime_cache() -> &'static Mutex<HashSet<PathBuf>> {
+    ORT_RUNTIME_CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn recognizer_cache() -> &'static Mutex<HashMap<PathBuf, PpOcrV4RecRecognizer>> {
+    RECOGNIZER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn ort_dylib_path(resource_root: &Path) -> PathBuf {
+    let file_name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    resource_root.join("onnxruntime").join(file_name)
+}
+
+pub fn ensure_ort_runtime_loaded(
+    resource_root: impl AsRef<Path>,
+) -> OcrResult<OrtRuntimeLoadReport> {
+    let resource_root = resource_root.as_ref().to_path_buf();
+    let dylib_path = ort_dylib_path(&resource_root);
+    let start = Instant::now();
+    let mut cache = ort_runtime_cache().lock().map_err(|error| {
+        OcrError::new(
+            OcrErrorCode::RuntimeCache,
+            format!("无法锁定 OCR ORT runtime 缓存: {error}"),
+            Some(dylib_path.clone()),
+        )
+    })?;
+    if cache.contains(&dylib_path) {
+        return Ok(OrtRuntimeLoadReport {
+            dylib_path,
+            cold_start: false,
+            elapsed_ms: start.elapsed().as_millis(),
+        });
+    }
+
+    init_ort_from(&dylib_path)
+        .map_err(|error| {
+            OcrError::new(
+                OcrErrorCode::OrtSession,
+                format!("无法加载 ONNX Runtime 动态库: {error}"),
+                Some(dylib_path.clone()),
+            )
+        })?
+        .commit();
+    cache.insert(dylib_path.clone());
+    Ok(OrtRuntimeLoadReport {
+        dylib_path,
+        cold_start: true,
+        elapsed_ms: start.elapsed().as_millis(),
+    })
+}
+
+pub fn with_cached_ppocr_recognizer<T, F>(
+    resource_root: impl AsRef<Path>,
+    mut operation: F,
+) -> OcrResult<(T, RecognizerAcquireReport)>
+where
+    F: FnMut(&mut PpOcrV4RecRecognizer) -> OcrResult<T>,
+{
+    let resource_root = resource_root.as_ref().to_path_buf();
+    let start = Instant::now();
+    let paths = PpOcrResourcePaths::from_resource_root(&resource_root);
+    let mut cache = recognizer_cache().lock().map_err(|error| {
+        OcrError::new(
+            OcrErrorCode::RuntimeCache,
+            format!("无法锁定 OCR 识别器缓存: {error}"),
+            Some(paths.model_path.clone()),
+        )
+    })?;
+    let mut cold_start = false;
+
+    match cache.entry(resource_root.clone()) {
+        Entry::Occupied(_) => {}
+        Entry::Vacant(entry) => {
+            let recognizer = PpOcrV4RecRecognizer::from_resource_root(&resource_root)?;
+            entry.insert(recognizer);
+            cold_start = true;
+        }
+    }
+
+    let recognizer = cache.get_mut(&resource_root).ok_or_else(|| {
+        OcrError::new(
+            OcrErrorCode::RuntimeCache,
+            "OCR 识别器缓存命中后无法取得实例",
+            Some(paths.model_path.clone()),
+        )
+    })?;
+    let model_path = recognizer.model_path().to_path_buf();
+    let output = operation(recognizer)?;
+    Ok((
+        output,
+        RecognizerAcquireReport {
+            resource_root,
+            model_path,
+            cold_start,
+            elapsed_ms: start.elapsed().as_millis(),
+        },
+    ))
 }
 
 impl PpOcrV4RecRecognizer {

@@ -16,13 +16,9 @@ use crate::telemetry;
 #[cfg(not(test))]
 use chrono::Utc;
 use image::DynamicImage;
-#[cfg(not(test))]
-use ort::init_from as init_ort_from;
 use serde::Serialize;
 #[cfg(not(test))]
 use std::fs;
-#[cfg(not(test))]
-use std::path::Path;
 use std::path::PathBuf;
 #[cfg(not(test))]
 use std::time::Instant;
@@ -475,24 +471,35 @@ pub(crate) fn run_calibrated_ocr_task(
         ),
         "准备显式加载 onnxruntime 动态库".to_string(),
     );
-    let ort_dylib_path = ort_dylib_path(&prepared.runtime_root);
-    init_ort_from(&ort_dylib_path)
-        .map_err(|error| {
-            format!(
-                "无法加载 ONNX Runtime 动态库 {}: {error}",
-                ort_dylib_path.display()
-            )
-        })?
-        .commit();
+    let ort_report = ocr::ensure_ort_runtime_loaded(&prepared.runtime_root)
+        .map_err(|error| error.to_string())?;
+    let ort_stage = if ort_report.cold_start {
+        "ocr-ort-init-success"
+    } else {
+        "ocr-ort-reuse-hit"
+    };
+    let ort_message = if ort_report.cold_start {
+        format!(
+            "ONNX Runtime 动态库冷启动完成 path={} cold_start_ms={}",
+            ort_report.dylib_path.display(),
+            ort_report.elapsed_ms
+        )
+    } else {
+        format!(
+            "ONNX Runtime 动态库复用命中 path={} reuse_hit_ms={}",
+            ort_report.dylib_path.display(),
+            ort_report.elapsed_ms
+        )
+    };
     log_ocr_stage(
         paths,
         trace_id,
-        "ocr-ort-init-success",
+        ort_stage,
         format!(
-            "ONNX Runtime 动态库初始化完成 path={}",
-            ort_dylib_path.display()
+            "ONNX Runtime 动态库可用 path={}",
+            ort_report.dylib_path.display()
         ),
-        "onnxruntime 动态库已显式加载".to_string(),
+        ort_message,
     );
 
     log_ocr_stage(
@@ -505,21 +512,6 @@ pub(crate) fn run_calibrated_ocr_task(
         ),
         "准备创建 ORT 会话并加载字符表".to_string(),
     );
-    let recognizer_start = Instant::now();
-    let mut recognizer = ocr::PpOcrV4RecRecognizer::from_resource_root(&prepared.runtime_root)
-        .map_err(|error| error.to_string())?;
-    log_ocr_stage(
-        paths,
-        trace_id,
-        "ocr-recognizer-init-success",
-        format!(
-            "OCR 识别器初始化完成 model={} elapsed_ms={}",
-            recognizer.model_path().display(),
-            recognizer_start.elapsed().as_millis()
-        ),
-        "模型、字符表与 ORT 会话已就绪".to_string(),
-    );
-
     let screenshot_path = match screenshot_path {
         Some(path) => path,
         None => {
@@ -540,16 +532,49 @@ pub(crate) fn run_calibrated_ocr_task(
         "准备裁剪校准区域并执行 OCR 推理".to_string(),
     );
     let inference_start = Instant::now();
-    let report = ocr::recognize_calibrated_name_slots_from_image(
-        &mut recognizer,
-        &dictionary,
-        &calibration,
-        &screenshot_path,
-        &paths.reports,
-        min_confidence,
-        min_match_score,
+    let (report, recognizer_report) = ocr::with_cached_ppocr_recognizer(
+        &prepared.runtime_root,
+        |recognizer| {
+            ocr::recognize_calibrated_name_slots_from_image(
+                recognizer,
+                &dictionary,
+                &calibration,
+                &screenshot_path,
+                &paths.reports,
+                min_confidence,
+                min_match_score,
+            )
+        },
     )
     .map_err(|error| error.to_string())?;
+    let recognizer_stage = if recognizer_report.cold_start {
+        "ocr-recognizer-init-success"
+    } else {
+        "ocr-recognizer-reuse-hit"
+    };
+    let recognizer_message = if recognizer_report.cold_start {
+        format!(
+            "OCR 识别器冷启动完成 model={} cold_start_ms={}",
+            recognizer_report.model_path.display(),
+            recognizer_report.elapsed_ms
+        )
+    } else {
+        format!(
+            "OCR 识别器复用命中 model={} reuse_hit_ms={}",
+            recognizer_report.model_path.display(),
+            recognizer_report.elapsed_ms
+        )
+    };
+    log_ocr_stage(
+        paths,
+        trace_id,
+        recognizer_stage,
+        format!(
+            "OCR 识别器可用 resource_root={}",
+            recognizer_report.resource_root.display()
+        ),
+        recognizer_message,
+    );
     log_ocr_stage(
         paths,
         trace_id,
@@ -681,18 +706,6 @@ fn write_runtime_panel_diagnostic(
         "已记录截图、区域活动、OCR 原文与失败原因".to_string(),
     );
     Ok(())
-}
-
-#[cfg(not(test))]
-fn ort_dylib_path(resource_root: &Path) -> PathBuf {
-    let file_name = if cfg!(target_os = "windows") {
-        "onnxruntime.dll"
-    } else if cfg!(target_os = "macos") {
-        "libonnxruntime.dylib"
-    } else {
-        "libonnxruntime.so"
-    };
-    resource_root.join("onnxruntime").join(file_name)
 }
 
 #[cfg(test)]
