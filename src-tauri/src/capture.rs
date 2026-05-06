@@ -1,15 +1,20 @@
 #![allow(dead_code)]
 
 use chrono::Utc;
+use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 use xcap::Monitor;
 
 const BLACK_MEAN_LUMA_THRESHOLD: f64 = 3.0;
 const BLACK_BRIGHT_PIXEL_RATIO_THRESHOLD: f64 = 0.001;
+static LAST_FRAME_HASH_BY_MONITOR: LazyLock<Mutex<HashMap<u32, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +58,23 @@ pub struct ImageDiagnostic {
     pub bright_pixel_ratio: f64,
     pub black_screen: bool,
     pub frame_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureFrameReport {
+    pub captured_at: String,
+    pub monitor: MonitorDiagnostic,
+    pub image: ImageDiagnostic,
+    pub png_path: Option<PathBuf>,
+    pub json_path: Option<PathBuf>,
+    pub previous_frame_hash: Option<String>,
+    pub stale_frame: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedMonitorFrame {
+    pub image: RgbaImage,
+    pub report: CaptureFrameReport,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,10 +122,20 @@ pub fn capture_monitor_sample(
     app_data_dir: impl AsRef<Path>,
     preferred_monitor_id: Option<u32>,
 ) -> Result<CaptureSampleReport, String> {
-    let samples_dir = capture_samples_dir(app_data_dir);
-    fs::create_dir_all(&samples_dir)
-        .map_err(|error| format!("无法创建截图样本目录 {}: {error}", samples_dir.display()))?;
+    let frame = capture_monitor_frame(app_data_dir, preferred_monitor_id, true)?;
+    frame.into_sample_report()
+}
 
+pub fn capture_monitor_frame(
+    app_data_dir: impl AsRef<Path>,
+    preferred_monitor_id: Option<u32>,
+    persist_to_disk: bool,
+) -> Result<CapturedMonitorFrame, String> {
+    let samples_dir = capture_samples_dir(&app_data_dir);
+    if persist_to_disk {
+        fs::create_dir_all(&samples_dir)
+            .map_err(|error| format!("无法创建截图样本目录 {}: {error}", samples_dir.display()))?;
+    }
     let monitors = Monitor::all().map_err(|error| format!("无法枚举显示器: {error}"))?;
     let monitor = select_monitor(monitors, preferred_monitor_id)?;
     let monitor_diagnostic = read_monitor_diagnostic(&monitor)?;
@@ -116,29 +148,16 @@ pub fn capture_monitor_sample(
 
     let analysis = analyze_rgba_frame(image.as_raw(), image.width(), image.height())?;
     let previous_frame_hash = latest_frame_hash(&samples_dir, monitor_diagnostic.id)?;
-    let stale_frame = previous_frame_hash
-        .as_deref()
-        .is_some_and(|hash| hash == analysis.frame_hash);
+    let stale_frame = is_stale_frame(previous_frame_hash.as_deref(), &analysis.frame_hash);
 
-    let timestamp = timestamp_for_filename();
-    let base_name = format!("monitor-{}-{timestamp}", monitor_diagnostic.id);
-    let png_path = samples_dir.join(format!("{base_name}.png"));
-    let json_path = samples_dir.join(format!("{base_name}.json"));
-
-    let save_start = Instant::now();
-    image
-        .save(&png_path)
-        .map_err(|error| format!("无法保存原始截图 {}: {error}", png_path.display()))?;
-    let save_duration_ms = save_start.elapsed().as_millis();
-
-    let report = CaptureSampleReport {
+    let mut report = CaptureFrameReport {
         captured_at: Utc::now().to_rfc3339(),
         monitor: monitor_diagnostic,
         image: ImageDiagnostic {
             width: image.width(),
             height: image.height(),
             capture_duration_ms,
-            save_duration_ms,
+            save_duration_ms: 0,
             mean_luma: analysis.mean_luma,
             min_luma: analysis.min_luma,
             max_luma: analysis.max_luma,
@@ -146,18 +165,17 @@ pub fn capture_monitor_sample(
             black_screen: analysis.black_screen,
             frame_hash: analysis.frame_hash,
         },
-        png_path: png_path.clone(),
-        json_path: json_path.clone(),
+        png_path: None,
+        json_path: None,
         previous_frame_hash,
         stale_frame,
     };
+    if persist_to_disk {
+        persist_capture_frame(&samples_dir, &image, &mut report)?;
+    }
+    remember_frame_hash(report.monitor.id, &report.image.frame_hash)?;
 
-    let content = serde_json::to_string_pretty(&report)
-        .map_err(|error| format!("无法序列化截图诊断 JSON: {error}"))?;
-    fs::write(&json_path, format!("{content}\n"))
-        .map_err(|error| format!("无法写入截图诊断 JSON {}: {error}", json_path.display()))?;
-
-    Ok(report)
+    Ok(CapturedMonitorFrame { image, report })
 }
 
 pub fn analyze_rgba_frame(
@@ -295,6 +313,9 @@ fn read_monitor_diagnostic(monitor: &Monitor) -> Result<MonitorDiagnostic, Strin
 }
 
 fn latest_frame_hash(samples_dir: &Path, monitor_id: u32) -> Result<Option<String>, String> {
+    if let Some(hash) = latest_frame_hash_from_memory(monitor_id)? {
+        return Ok(Some(hash));
+    }
     let prefix = format!("monitor-{monitor_id}-");
     let path = latest_sample_json_path_by(samples_dir, |file_name| file_name.starts_with(&prefix))?;
     let Some(path) = path else {
@@ -302,6 +323,81 @@ fn latest_frame_hash(samples_dir: &Path, monitor_id: u32) -> Result<Option<Strin
     };
     let report = read_capture_sample_report(&path)?;
     Ok(Some(report.image.frame_hash))
+}
+
+fn latest_frame_hash_from_memory(monitor_id: u32) -> Result<Option<String>, String> {
+    LAST_FRAME_HASH_BY_MONITOR
+        .lock()
+        .map(|cache| cache.get(&monitor_id).cloned())
+        .map_err(|error| format!("无法锁定截图哈希缓存: {error}"))
+}
+
+fn remember_frame_hash(monitor_id: u32, frame_hash: &str) -> Result<(), String> {
+    LAST_FRAME_HASH_BY_MONITOR
+        .lock()
+        .map_err(|error| format!("无法写入截图哈希缓存: {error}"))?
+        .insert(monitor_id, frame_hash.to_string());
+    Ok(())
+}
+
+fn persist_capture_frame(
+    samples_dir: &Path,
+    image: &RgbaImage,
+    report: &mut CaptureFrameReport,
+) -> Result<(), String> {
+    let timestamp = timestamp_for_filename();
+    let base_name = format!("monitor-{}-{timestamp}", report.monitor.id);
+    let png_path = samples_dir.join(format!("{base_name}.png"));
+    let json_path = samples_dir.join(format!("{base_name}.json"));
+
+    let save_start = Instant::now();
+    image
+        .save(&png_path)
+        .map_err(|error| format!("无法保存原始截图 {}: {error}", png_path.display()))?;
+    let save_duration_ms = save_start.elapsed().as_millis();
+
+    report.image.save_duration_ms = save_duration_ms;
+    report.png_path = Some(png_path.clone());
+    report.json_path = Some(json_path.clone());
+
+    let sample_report = CaptureSampleReport {
+        captured_at: report.captured_at.clone(),
+        monitor: report.monitor.clone(),
+        image: report.image.clone(),
+        png_path: png_path.clone(),
+        json_path: json_path.clone(),
+        previous_frame_hash: report.previous_frame_hash.clone(),
+        stale_frame: report.stale_frame,
+    };
+    let content = serde_json::to_string_pretty(&sample_report)
+        .map_err(|error| format!("无法序列化截图诊断 JSON: {error}"))?;
+    fs::write(&json_path, format!("{content}\n"))
+        .map_err(|error| format!("无法写入截图诊断 JSON {}: {error}", json_path.display()))?;
+    Ok(())
+}
+
+impl CapturedMonitorFrame {
+    fn into_sample_report(self) -> Result<CaptureSampleReport, String> {
+        let png_path = self
+            .report
+            .png_path
+            .clone()
+            .ok_or_else(|| "截图样本未落盘，无法转换为持久化截图报告".to_string())?;
+        let json_path = self
+            .report
+            .json_path
+            .clone()
+            .ok_or_else(|| "截图诊断未落盘，无法转换为持久化截图报告".to_string())?;
+        Ok(CaptureSampleReport {
+            captured_at: self.report.captured_at,
+            monitor: self.report.monitor,
+            image: self.report.image,
+            png_path,
+            json_path,
+            previous_frame_hash: self.report.previous_frame_hash,
+            stale_frame: self.report.stale_frame,
+        })
+    }
 }
 
 fn latest_sample_json_path(samples_dir: &Path) -> Result<Option<PathBuf>, String> {

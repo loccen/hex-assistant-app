@@ -19,7 +19,8 @@ impl Default for AppSettings {
             language: "zh-CN".to_string(),
             capture: CaptureSettings {
                 preferred_monitor_id: None,
-                poll_interval_ms: 1000,
+                poll_interval_ms: default_active_poll_interval_ms(),
+                idle_poll_interval_ms: default_idle_poll_interval_ms(),
                 retry_delay_ms: 200,
                 default_display_mode: "borderless".to_string(),
             },
@@ -47,7 +48,10 @@ impl Default for AppSettings {
 #[serde(rename_all = "camelCase")]
 pub struct CaptureSettings {
     pub preferred_monitor_id: Option<String>,
+    #[serde(default = "default_active_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub idle_poll_interval_ms: u64,
     pub retry_delay_ms: u64,
     pub default_display_mode: String,
 }
@@ -80,6 +84,14 @@ pub struct ApexLolSettings {
 
 fn default_failed_cache_ttl_minutes() -> u64 {
     5
+}
+
+fn default_active_poll_interval_ms() -> u64 {
+    500
+}
+
+fn default_idle_poll_interval_ms() -> u64 {
+    2500
 }
 
 #[derive(Debug, Clone, Serialize)]

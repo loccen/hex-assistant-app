@@ -452,9 +452,8 @@ pub(crate) fn run_calibrated_ocr_task(
         "准备裁剪校准区域并执行 OCR 推理".to_string(),
     );
     let inference_start = Instant::now();
-    let (report, recognizer_report) = ocr::with_cached_ppocr_recognizer(
-        &prepared.runtime_root,
-        |recognizer| {
+    let (report, recognizer_report) =
+        ocr::with_cached_ppocr_recognizer(&prepared.runtime_root, |recognizer| {
             ocr::recognize_calibrated_name_slots_from_image(
                 recognizer,
                 &dictionary,
@@ -464,9 +463,8 @@ pub(crate) fn run_calibrated_ocr_task(
                 min_confidence,
                 min_match_score,
             )
-        },
-    )
-    .map_err(|error| error.to_string())?;
+        })
+        .map_err(|error| error.to_string())?;
     let recognizer_stage = if recognizer_report.cold_start {
         "ocr-recognizer-init-success"
     } else {

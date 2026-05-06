@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use tauri::AppHandle;
 
 const RECENT_EVENT_LIMIT: usize = 40;
-const MIN_LISTEN_INTERVAL_MS: u64 = 2_500;
+const MIN_ACTIVE_LISTEN_INTERVAL_MS: u64 = 250;
+const MIN_IDLE_LISTEN_INTERVAL_MS: u64 = 1_500;
 const ALLOWED_GAME_MODES: &[&str] = &["KIWI"];
 const MODE_MISMATCH_ERROR_CODE: &str = "HEX-LIVE-CLIENT-MODE-MISMATCH";
 
@@ -239,11 +240,6 @@ impl RuntimeOrchestratorHandle {
         let paths = AppPaths::from_app(app)?;
         paths.ensure_all()?;
         let settings = load_or_create_settings(&paths)?;
-        let interval_ms = settings
-            .capture
-            .poll_interval_ms
-            .max(MIN_LISTEN_INTERVAL_MS);
-
         let Some(generation) = self.register_listener_start(&paths, request)? else {
             return self.snapshot();
         };
@@ -253,22 +249,26 @@ impl RuntimeOrchestratorHandle {
         let listener_generation = Arc::clone(&self.listener_generation);
         let worker_paths = paths.clone();
         let worker_app = app.clone();
+        let worker_settings = settings.clone();
         let handle = thread::spawn(move || {
             while listening.load(Ordering::SeqCst)
                 && listener_generation.load(Ordering::SeqCst) == generation
             {
                 let live_result = LiveClientDataApi::new().fetch_resolved_player_snapshot();
-                let overlay_plan = if let Ok(mut orchestrator) = inner.lock() {
-                    orchestrator
-                        .tick(
-                            Some(&worker_app),
-                            &worker_paths,
-                            RuntimeTriggerEvent::LowFrequencyPoll,
-                            live_result,
-                        )
-                        .ok()
+                let (overlay_plan, next_interval_ms) = if let Ok(mut orchestrator) = inner.lock() {
+                    let result = orchestrator.tick(
+                        Some(&worker_app),
+                        &worker_paths,
+                        RuntimeTriggerEvent::LowFrequencyPoll,
+                        live_result,
+                    );
+                    orchestrator.log_poll_interval_decision(&worker_paths, &worker_settings);
+                    (
+                        result.ok(),
+                        orchestrator.next_poll_interval_ms(&worker_settings),
+                    )
                 } else {
-                    None
+                    (None, worker_settings.capture.idle_poll_interval_ms)
                 };
                 if let Some(overlay_plan) = overlay_plan {
                     let result = apply_overlay_plan(&worker_app, &overlay_plan);
@@ -295,7 +295,10 @@ impl RuntimeOrchestratorHandle {
                                             overlay::RuntimeOverlaySyncAction::Hidden
                                         }
                                     },
-                                    visible: matches!(overlay_plan, RuntimeOverlayPlan::Show { .. }),
+                                    visible: matches!(
+                                        overlay_plan,
+                                        RuntimeOverlayPlan::Show { .. }
+                                    ),
                                     window_exists: false,
                                     slot_count: match &overlay_plan {
                                         RuntimeOverlayPlan::Show { slots, .. } => slots.len(),
@@ -318,7 +321,7 @@ impl RuntimeOrchestratorHandle {
                 {
                     break;
                 }
-                thread::sleep(Duration::from_millis(interval_ms));
+                thread::sleep(Duration::from_millis(next_interval_ms));
             }
         });
 
@@ -386,8 +389,12 @@ impl RuntimeOrchestratorHandle {
                     &RuntimeOverlaySyncReport {
                         label: "hex-assistant-overlay".to_string(),
                         action: match overlay_plan {
-                            RuntimeOverlayPlan::Show { .. } => overlay::RuntimeOverlaySyncAction::Created,
-                            RuntimeOverlayPlan::Hide { .. } => overlay::RuntimeOverlaySyncAction::Hidden,
+                            RuntimeOverlayPlan::Show { .. } => {
+                                overlay::RuntimeOverlaySyncAction::Created
+                            }
+                            RuntimeOverlayPlan::Hide { .. } => {
+                                overlay::RuntimeOverlaySyncAction::Hidden
+                            }
                         },
                         visible: matches!(overlay_plan, RuntimeOverlayPlan::Show { .. }),
                         window_exists: false,
@@ -843,6 +850,32 @@ impl RuntimeOrchestrator {
         }
     }
 
+    fn next_poll_interval_ms(&self, settings: &crate::models::AppSettings) -> u64 {
+        let active_interval_ms = settings
+            .capture
+            .poll_interval_ms
+            .max(MIN_ACTIVE_LISTEN_INTERVAL_MS);
+        let idle_interval_ms = settings
+            .capture
+            .idle_poll_interval_ms
+            .max(MIN_IDLE_LISTEN_INTERVAL_MS);
+        let state = self.machine.state();
+        let should_use_active_interval = state.pause_reason.is_none()
+            && state
+                .player
+                .as_ref()
+                .is_some_and(|player| player.level >= 3)
+            && (self.panel_snapshot.panel_state == PanelState::Expanded
+                || !state.pending_tiers.is_empty()
+                || !state.visible_choices.is_empty());
+
+        if should_use_active_interval {
+            active_interval_ms
+        } else {
+            idle_interval_ms
+        }
+    }
+
     fn log_panel_snapshot_refresh(
         &self,
         paths: &AppPaths,
@@ -1099,6 +1132,45 @@ impl RuntimeOrchestrator {
             },
         )?;
         Ok(())
+    }
+
+    fn log_poll_interval_decision(&self, paths: &AppPaths, settings: &crate::models::AppSettings) {
+        let state = self.machine.state();
+        let next_interval_ms = self.next_poll_interval_ms(settings);
+        let active_interval_ms = settings
+            .capture
+            .poll_interval_ms
+            .max(MIN_ACTIVE_LISTEN_INTERVAL_MS);
+        let idle_interval_ms = settings
+            .capture
+            .idle_poll_interval_ms
+            .max(MIN_IDLE_LISTEN_INTERVAL_MS);
+        let mode = if next_interval_ms == active_interval_ms {
+            "active"
+        } else {
+            "idle"
+        };
+        let payload = json!({
+            "mode": mode,
+            "nextIntervalMs": next_interval_ms,
+            "activeIntervalMs": active_interval_ms,
+            "idleIntervalMs": idle_interval_ms,
+            "panelState": self.panel_snapshot.panel_state,
+            "pendingTiers": state.pending_tiers,
+            "visibleChoiceCount": state.visible_choices.len(),
+            "pauseReason": state.pause_reason.as_ref().map(|reason| format!("{reason:?}")),
+            "playerLevel": state.player.as_ref().map(|player| player.level),
+        });
+        if let Err(log_error) = self.write_runtime_log(
+            paths,
+            "poll-interval-decision",
+            "已记录下一轮轮询间隔决策",
+            "info",
+            None,
+            &payload,
+        ) {
+            eprintln!("写入轮询间隔决策日志失败: {log_error}");
+        }
     }
 }
 
