@@ -193,6 +193,13 @@ const runtimeStatusText: Record<string, string> = {
   paused: "已暂停",
 };
 
+const runtimeStatusAccent: Record<string, string> = {
+  waitingForGame: "neutral",
+  waitingForTier: "watch",
+  pendingSelection: "live",
+  paused: "warn",
+};
+
 function emptyMarkState(): MarkState {
   return {
     nameRegions: [null, null, null],
@@ -678,10 +685,21 @@ function PlayerApp() {
 
   return (
     <main className="app-shell">
+      <div className="app-shell-glow app-shell-glow-left" />
+      <div className="app-shell-glow app-shell-glow-right" />
       <header className="topbar">
-        <div>
+        <div className="topbar-copy">
           <p className="eyebrow">Northlight Panel</p>
-          <h1>{mode === "calibration" || calibrated === false ? "首次校准向导" : "助手状态"}</h1>
+          <h1>{mode === "calibration" || calibrated === false ? "海克斯校准与接管" : "对局助手面板"}</h1>
+          <p className="topbar-subtitle">
+            {mode === "calibration" || calibrated === false
+              ? "把游戏画面、识别区域和底部锚点校准到当前设备，后续识别和 Overlay 才会稳定。"
+              : "在局内海克斯阶段自动识别候选，保持低干扰常驻，并把可用信息压到你需要的位置。"}
+          </p>
+        </div>
+        <div className="topbar-badge">
+          <span>目标模式</span>
+          <strong>海克斯乱斗 / KIWI</strong>
         </div>
       </header>
 
@@ -708,42 +726,75 @@ function StatusPanel({
   onRefresh: () => void;
   onRecalibrate: () => void;
 }) {
+  const runtimeStatus = runtime ? runtimeStatusText[runtime.state.status] ?? runtime.state.status : "待启动";
+  const accent = runtime ? runtimeStatusAccent[runtime.state.status] ?? "neutral" : "neutral";
+  const pendingTierText =
+    runtime && runtime.state.pendingTiers.length > 0 ? runtime.state.pendingTiers.join(" / ") : "无待处理档位";
+  const faultText = runtime?.lastErrorCode ?? runtime?.state.pauseReason ?? "链路正常";
+
   return (
-    <section className="panel status-panel">
-      <dl className="status-grid">
-        <div>
-          <dt>运行状态</dt>
-          <dd>{runtime?.listening ? "监听中" : "未监听"}</dd>
+    <section className="status-stack">
+      <article className={`panel status-hero status-hero-${accent}`}>
+        <div className="status-hero-main">
+          <p className="section-kicker">实时态势</p>
+          <div className="status-hero-title-row">
+            <h2>{runtimeStatus}</h2>
+            <span className={`signal-pill signal-pill-${accent}`}>{runtime?.listening ? "监听中" : "待命"}</span>
+          </div>
+          <p className="status-hero-summary">{automationStatus.message}</p>
+          <div className="button-row">
+            <button type="button" onClick={onRefresh} disabled={busy !== null}>
+              刷新状态
+            </button>
+            <button type="button" onClick={onRecalibrate} disabled={busy !== null}>
+              重新校准
+            </button>
+          </div>
         </div>
-        <div>
-          <dt>校准状态</dt>
-          <dd>{profile ? "已完成" : "未完成"}</dd>
+        <div className="status-hero-side">
+          <div className="hero-metric">
+            <span>待处理海克斯</span>
+            <strong>{pendingTierText}</strong>
+          </div>
+          <div className="hero-metric">
+            <span>最近链路状态</span>
+            <strong>{faultText}</strong>
+          </div>
         </div>
-        <div>
-          <dt>当前阶段</dt>
-          <dd>{runtime ? runtimeStatusText[runtime.state.status] ?? runtime.state.status : "待启动"}</dd>
-        </div>
-        <div>
-          <dt>待处理档位</dt>
-          <dd>{runtime && runtime.state.pendingTiers.length > 0 ? runtime.state.pendingTiers.join(" / ") : "无"}</dd>
-        </div>
-        <div>
-          <dt>最近状态</dt>
-          <dd>{runtime?.lastErrorCode ?? runtime?.state.pauseReason ?? "正常"}</dd>
-        </div>
-        <div>
-          <dt>自动编排</dt>
-          <dd>{automationStatus.message}</dd>
-        </div>
-      </dl>
-      <div className="button-row">
-        <button type="button" onClick={onRefresh} disabled={busy !== null}>
-          刷新状态
-        </button>
-        <button type="button" onClick={onRecalibrate} disabled={busy !== null}>
-          重新校准
-        </button>
-      </div>
+      </article>
+
+      <section className="status-grid">
+        <article className="status-card">
+          <span>运行状态</span>
+          <strong>{runtime?.listening ? "后台监听已接管" : "当前未接管"}</strong>
+          <p>用于判断 Tauri 后台监听和运行时编排器是否仍在活动。</p>
+        </article>
+        <article className="status-card">
+          <span>校准状态</span>
+          <strong>{profile ? "当前设备已完成校准" : "还没有可用校准"}</strong>
+          <p>校准决定截图裁剪区域、底部锚点和 Overlay 定位能否稳定命中。</p>
+        </article>
+        <article className="status-card">
+          <span>当前阶段</span>
+          <strong>{runtimeStatus}</strong>
+          <p>这里反映的是编排器状态，而不是单次命令结果。</p>
+        </article>
+        <article className="status-card">
+          <span>待处理档位</span>
+          <strong>{pendingTierText}</strong>
+          <p>有待处理档位时，前端和 Overlay 才会进入更积极的识别节奏。</p>
+        </article>
+        <article className="status-card">
+          <span>异常与暂停</span>
+          <strong>{faultText}</strong>
+          <p>优先看这里判断是 live client、模式不匹配还是识别链路被暂停。</p>
+        </article>
+        <article className="status-card status-card-wide">
+          <span>自动编排说明</span>
+          <strong>{automationStatus.phase}</strong>
+          <p>{automationStatus.message}</p>
+        </article>
+      </section>
     </section>
   );
 }
@@ -798,16 +849,30 @@ function CalibrationWizard({
   return (
     <section className="wizard-grid">
       <article className="panel guide-panel">
-        <h2>准备游戏画面</h2>
+        <div className="guide-panel-header">
+          <p className="section-kicker">校准向导</p>
+          <h2>先把战场对准，再让助手接管</h2>
+          <p className="guide-lead">
+            这一步不是技术配置，而是为当前分辨率、缩放和游戏 UI 建立一套可靠坐标。做对一次，后面才能少打扰你。
+          </p>
+        </div>
+        <div className="guide-progress">
+          <div className="guide-progress-copy">
+            <span>校准完成度</span>
+            <strong>
+              {completedMarks}/{regionDefinitions.length}
+            </strong>
+          </div>
+          <div className="guide-progress-bar">
+            <span style={{ width: `${(completedMarks / regionDefinitions.length) * 100}%` }} />
+          </div>
+        </div>
         <ol className="step-list">
-          <li>打开英雄联盟。</li>
-          <li>创建一局自定义游戏。</li>
-          <li>选择海克斯乱斗并进入游戏。</li>
-          <li>在游戏设置中选择无边框。</li>
-          <li>回到助手，选择目标显示器。</li>
-          <li>点击“5 秒后截图”，立刻切回游戏并等待。</li>
-          <li>如果之前已经截过图，也可以直接点击“加载最近截图”。</li>
-          <li>截图完成后可以关闭或离开游戏。</li>
+          <li>打开英雄联盟并进入一局海克斯乱斗自定义游戏。</li>
+          <li>将游戏显示模式切到无边框，保持目标分辨率不再变动。</li>
+          <li>选择目标显示器，倒计时截图后立刻切回游戏等待完成。</li>
+          <li>截图完成后，依次标出三槽名称、三张卡片底部和底部展开按钮。</li>
+          <li>先跑一次三槽识别校验，确认文本与落点没有偏移，再保存。</li>
         </ol>
         <div className="capture-controls">
           <label>
@@ -844,9 +909,10 @@ function CalibrationWizard({
       <article className="panel marking-panel">
         <div className="marking-header">
           <div>
-            <h2>标记校准区域</h2>
+            <p className="section-kicker">截图标定</p>
+            <h2>把识别区域和定位锚点钉死在这张截图上</h2>
             <p>
-              已完成 {completedMarks}/{regionDefinitions.length}，当前：{regionDefinitions.find((item) => item.key === activeRegion)?.label}
+              当前正在编辑：{regionDefinitions.find((item) => item.key === activeRegion)?.label}
             </p>
           </div>
         </div>
@@ -874,7 +940,10 @@ function CalibrationWizard({
 
       <article className="panel check-panel">
         <div className="panel-heading">
-          <h2>三槽识别校验</h2>
+          <div>
+            <p className="section-kicker">识别校验</p>
+            <h2>先看这次识别像不像玩家会相信的结果</h2>
+          </div>
           <button type="button" onClick={onRunOcrCheck} disabled={busy !== null || !readyToCheck}>
             生成校验结果
           </button>
@@ -1022,8 +1091,8 @@ function ScreenshotPreview({
             <img src={screenshot.dataUrl} alt="校准截图" draggable={false} />
           ) : (
             <div className="preview-placeholder">
-              <strong>等待截图</strong>
-              <span>截图后会在这里显示游戏画面。</span>
+              <strong>等待游戏截图</strong>
+              <span>倒计时完成后，这里会成为你的校准工作台。</span>
             </div>
           )}
           {visibleRects.map((item) => (
@@ -1064,6 +1133,7 @@ function RegionList({
   return (
     <aside className="region-panel">
       <div className="region-actions">
+        <p className="section-kicker">标记列表</p>
         <button type="button" onClick={onClear}>
           清空标记
         </button>
@@ -1146,7 +1216,7 @@ function OverlayPage() {
           }}
         >
           <div className="overlay-card-topline">
-            <span>Slot {card.slot}</span>
+            <span>槽位 {card.slot}</span>
             {card.rank ? <strong>{card.rank}</strong> : null}
           </div>
           <h1>{card.title}</h1>
