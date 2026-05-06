@@ -329,17 +329,13 @@ function PlayerApp() {
   useEffect(() => {
     const screenshotPath = capture?.pngPath ?? null;
     if (!screenshotPath) {
-      nameOcrSlotKeysRef.current = [null, null, null];
-      nameOcrRequestIdsRef.current = [0, 0, 0];
-      setLiveNameOcr(buildEmptyNameOcrPreview());
+      resetAllNameOcrPreview();
       return;
     }
 
     marks.nameRegions.forEach((region, index) => {
-      if (!region) {
-        nameOcrSlotKeysRef.current[index] = null;
-        nameOcrRequestIdsRef.current[index] = 0;
-        setLiveNameOcr((current) => updateNameOcrSlot(current, index, buildIdleNameOcrPreviewSlot(index)));
+      if (!isPixelRect(region)) {
+        resetNameOcrPreviewSlot(index);
         return;
       }
       const nextSignature = `${screenshotPath}:${rectSignature(region)}`;
@@ -493,9 +489,7 @@ function PlayerApp() {
     setActiveRegion("name-0");
     setCalibrationStepIndex(0);
     setOcrReport(null);
-    setLiveNameOcr(buildEmptyNameOcrPreview());
-    nameOcrSlotKeysRef.current = [null, null, null];
-    nameOcrRequestIdsRef.current = [0, 0, 0];
+    resetAllNameOcrPreview();
     setError(null);
     setToast({ tone: "info", message });
     void loadMonitors();
@@ -649,12 +643,10 @@ function PlayerApp() {
   async function loadCaptureIntoCalibration(data: CaptureSampleReport, successMessage: string) {
     setCapture(data);
     setOcrReport(null);
-    setLiveNameOcr(buildEmptyNameOcrPreview());
+    resetAllNameOcrPreview();
     setMarks(emptyMarkState());
     setActiveRegion("name-0");
     setCalibrationStepIndex(calibrationSteps.length - 1);
-    nameOcrSlotKeysRef.current = [null, null, null];
-    nameOcrRequestIdsRef.current = [0, 0, 0];
     const imageData = await runCommand<ScreenshotDataUrl>("screenshot-data", "read_png_file_as_data_url", {
       path: data.pngPath,
     });
@@ -741,9 +733,19 @@ function PlayerApp() {
     setMarks(() => emptyMarkState());
     setActiveRegion("name-0");
     setOcrReport(null);
-    setLiveNameOcr(buildEmptyNameOcrPreview());
+    resetAllNameOcrPreview();
+  }
+
+  function resetNameOcrPreviewSlot(index: number) {
+    nameOcrSlotKeysRef.current[index] = null;
+    nameOcrRequestIdsRef.current[index] = 0;
+    setLiveNameOcr((current) => updateNameOcrSlot(current, index, buildIdleNameOcrPreviewSlot(index)));
+  }
+
+  function resetAllNameOcrPreview() {
     nameOcrSlotKeysRef.current = [null, null, null];
     nameOcrRequestIdsRef.current = [0, 0, 0];
+    setLiveNameOcr(buildEmptyNameOcrPreview());
   }
 
   function buildCalibrationInput(): CalibrationInput | null {
@@ -797,7 +799,7 @@ function PlayerApp() {
           readyToSave={readyToSave}
           ocrReport={ocrReport}
           nameOcrPreview={mergeNameOcrPreview(liveNameOcr, ocrReport)}
-          onClearMarks={clearCalibrationMarks}
+          onResetCalibrationMarks={clearCalibrationMarks}
           onRefreshMonitors={loadMonitors}
           onCapture={captureAfterDelay}
           onLoadLatestCapture={loadLatestCapture}
@@ -955,7 +957,7 @@ function CalibrationWizard({
   readyToSave,
   ocrReport,
   nameOcrPreview,
-  onClearMarks,
+  onResetCalibrationMarks,
   onRefreshMonitors,
   onCapture,
   onLoadLatestCapture,
@@ -982,7 +984,7 @@ function CalibrationWizard({
   readyToSave: boolean;
   ocrReport: CalibratedNameOcrReport | null;
   nameOcrPreview: NameOcrPreviewSlot[];
-  onClearMarks: () => void;
+  onResetCalibrationMarks: () => void;
   onRefreshMonitors: () => void;
   onCapture: () => void;
   onLoadLatestCapture: () => void;
@@ -1101,7 +1103,7 @@ function CalibrationWizard({
             activeRegion={activeRegion}
             setActiveRegion={setActiveRegion}
             nameOcrPreview={nameOcrPreview}
-            onClear={onClearMarks}
+            onClearMarks={onResetCalibrationMarks}
           />
         </div>
       </article>
@@ -1292,19 +1294,19 @@ function RegionList({
   activeRegion,
   setActiveRegion,
   nameOcrPreview,
-  onClear,
+  onClearMarks,
 }: {
   marks: MarkState;
   activeRegion: RegionKey;
   setActiveRegion: (key: RegionKey) => void;
   nameOcrPreview: NameOcrPreviewSlot[];
-  onClear: () => void;
+  onClearMarks: () => void;
 }) {
   return (
     <aside className="region-panel">
       <div className="region-actions">
         <p className="section-kicker">标记列表</p>
-        <button type="button" onClick={onClear}>
+        <button type="button" onClick={onClearMarks}>
           清空标记
         </button>
       </div>
@@ -1389,6 +1391,10 @@ function mergeNameOcrPreview(
 
 function buildCalibrationSnapshot(marks: MarkState): string {
   return JSON.stringify(marks);
+}
+
+function isPixelRect(region: PixelRect | null): region is PixelRect {
+  return region !== null;
 }
 
 function rectSignature(rect: PixelRect): string {
