@@ -41,6 +41,36 @@ mise exec -- cargo check --manifest-path src-tauri/Cargo.toml
 - 只要本轮修改了代码，默认还必须重新构建一份可交付的 Windows 安装包给用户测试，除非用户明确说明这轮不需要安装包。
 - 构建 Windows 安装包后，答复中必须明确给出安装包产物路径和本轮实际执行的构建命令。
 
+### Windows 安装包与排障包
+
+- 正式给用户的默认 Windows 安装包必须使用不带排障开关的命令构建：
+
+```bash
+mise exec -- npm run build:windows
+```
+
+- 排障模式通过 Rust 编译开关 `debug-diagnostics` 显式开启，只用于本地问题定位或让用户复现疑难问题时单独出包，默认发版必须关闭该开关。
+- 本地调试排障模式可使用：
+
+```bash
+mise exec -- npm run tauri:debug-diagnostics
+```
+
+- 构建 Windows 排障包可使用：
+
+```bash
+mise exec -- npm run build:windows:debug
+```
+
+- 仅检查 Rust 排障模式是否可编译可使用：
+
+```bash
+mise exec -- npm run check:rust:debug
+```
+
+- 排障模式开启后，允许额外输出高噪声诊断信息，例如 `runtime-panel-diagnostic-*.json` 和 `overlay-debug.log`；正式包默认不应包含这些高频调试落盘行为。
+- 后续若线上问题需要重新排查，应优先在最新代码基础上开启 `debug-diagnostics` 重出排障包，不要依赖长期漂移的专用排障分支。
+
 ## 代码组织
 
 - Rust 侧按职责拆模块，不把所有 Tauri command 堆在一个文件。
