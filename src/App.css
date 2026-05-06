@@ -773,6 +773,16 @@ h2 {
   background: rgba(77, 56, 23, 0.24);
 }
 
+.ocr-preview-card.pending {
+  border-color: rgba(113, 186, 221, 0.32);
+  background: rgba(18, 50, 63, 0.24);
+}
+
+.ocr-preview-card.error {
+  border-color: rgba(234, 139, 111, 0.3);
+  background: rgba(72, 26, 22, 0.26);
+}
+
 .ocr-preview-head {
   display: flex;
   align-items: center;

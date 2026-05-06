@@ -102,6 +102,17 @@ type CalibratedNameOcrReport = {
   }>;
 };
 
+type NameRegionOcrPrecheckReport = {
+  rawText: string;
+  confidence: number;
+  matchScore: number;
+  finalName?: string | null;
+  failureReason?: string | null;
+  belowConfidenceThreshold: boolean;
+  belowMatchThreshold: boolean;
+  requiresUserAdjustment: boolean;
+};
+
 type TrayExportEvent = {
   status: "started" | "completed" | "failed";
   zipPath?: string | null;
@@ -182,10 +193,13 @@ type CalibrationStep = {
 type NameOcrPreviewSlot = {
   slot: "left" | "center" | "right";
   text: string | null;
+  rawText: string | null;
   confidence: number | null;
+  matchScore: number | null;
   lowConfidence: boolean;
   hint: string | null;
   source: "placeholder" | "live" | "ocr-check";
+  status: "idle" | "pending" | "ready" | "error";
 };
 
 const regionDefinitions: RegionDefinition[] = [
@@ -257,12 +271,15 @@ function PlayerApp() {
   const [drag, setDrag] = useState<DragState | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [ocrReport, setOcrReport] = useState<CalibratedNameOcrReport | null>(null);
-  const [liveNameOcr] = useState<NameOcrPreviewSlot[] | null>(null);
+  const [liveNameOcr, setLiveNameOcr] = useState<NameOcrPreviewSlot[]>(() => buildEmptyNameOcrPreview());
   const [toast, setToast] = useState<Toast | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const runtimeRef = useRef<RuntimeLoopSnapshot | null>(null);
   const controlQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const nameOcrSlotKeysRef = useRef<[string | null, string | null, string | null]>([null, null, null]);
+  const nameOcrRequestIdsRef = useRef<[number, number, number]>([0, 0, 0]);
+  const lastCalibrationSnapshotRef = useRef<string | null>(null);
 
   useEffect(() => {
     runtimeRef.current = runtime;
@@ -296,6 +313,46 @@ function PlayerApp() {
     }, 2500);
     return () => window.clearInterval(timer);
   }, [runtime?.listening]);
+
+  useEffect(() => {
+    const calibrationSnapshot = buildCalibrationSnapshot(marks);
+    if (lastCalibrationSnapshotRef.current === null) {
+      lastCalibrationSnapshotRef.current = calibrationSnapshot;
+      return;
+    }
+    if (lastCalibrationSnapshotRef.current !== calibrationSnapshot) {
+      lastCalibrationSnapshotRef.current = calibrationSnapshot;
+      setOcrReport(null);
+    }
+  }, [marks]);
+
+  useEffect(() => {
+    const screenshotPath = capture?.pngPath ?? null;
+    if (!screenshotPath) {
+      nameOcrSlotKeysRef.current = [null, null, null];
+      nameOcrRequestIdsRef.current = [0, 0, 0];
+      setLiveNameOcr(buildEmptyNameOcrPreview());
+      return;
+    }
+
+    marks.nameRegions.forEach((region, index) => {
+      if (!region) {
+        nameOcrSlotKeysRef.current[index] = null;
+        nameOcrRequestIdsRef.current[index] = 0;
+        setLiveNameOcr((current) => updateNameOcrSlot(current, index, buildIdleNameOcrPreviewSlot(index)));
+        return;
+      }
+      const nextSignature = `${screenshotPath}:${rectSignature(region)}`;
+      if (nameOcrSlotKeysRef.current[index] === nextSignature) {
+        return;
+      }
+      nameOcrSlotKeysRef.current[index] = nextSignature;
+      const requestId = Date.now() + index;
+      nameOcrRequestIdsRef.current[index] = requestId;
+      setLiveNameOcr((current) => updateNameOcrSlot(current, index, buildPendingNameOcrPreviewSlot(index)));
+      void runNameRegionPrecheck(index, region, screenshotPath, nextSignature, requestId);
+    });
+  }, [capture?.pngPath, marks.nameRegions]);
 
   const completedMarks = useMemo(() => {
     return [
@@ -436,6 +493,9 @@ function PlayerApp() {
     setActiveRegion("name-0");
     setCalibrationStepIndex(0);
     setOcrReport(null);
+    setLiveNameOcr(buildEmptyNameOcrPreview());
+    nameOcrSlotKeysRef.current = [null, null, null];
+    nameOcrRequestIdsRef.current = [0, 0, 0];
     setError(null);
     setToast({ tone: "info", message });
     void loadMonitors();
@@ -589,9 +649,12 @@ function PlayerApp() {
   async function loadCaptureIntoCalibration(data: CaptureSampleReport, successMessage: string) {
     setCapture(data);
     setOcrReport(null);
+    setLiveNameOcr(buildEmptyNameOcrPreview());
     setMarks(emptyMarkState());
     setActiveRegion("name-0");
     setCalibrationStepIndex(calibrationSteps.length - 1);
+    nameOcrSlotKeysRef.current = [null, null, null];
+    nameOcrRequestIdsRef.current = [0, 0, 0];
     const imageData = await runCommand<ScreenshotDataUrl>("screenshot-data", "read_png_file_as_data_url", {
       path: data.pngPath,
     });
@@ -614,6 +677,36 @@ function PlayerApp() {
     if (data) {
       setOcrReport(data);
       setToast({ tone: "success", message: "已生成三槽识别校验结果，请确认区域和定位。" });
+    }
+  }
+
+  async function runNameRegionPrecheck(
+    index: number,
+    region: PixelRect,
+    screenshotPath: string,
+    signature: string,
+    requestId: number,
+  ) {
+    try {
+      const report = await invoke<NameRegionOcrPrecheckReport>("run_name_region_ocr_precheck", {
+        input: {
+          screenshotPath,
+          nameRegion: region,
+        },
+      });
+      if (nameOcrSlotKeysRef.current[index] !== signature || nameOcrRequestIdsRef.current[index] !== requestId) {
+        return;
+      }
+      setLiveNameOcr((current) =>
+        updateNameOcrSlot(current, index, buildResolvedNameOcrPreviewSlot(index, report)),
+      );
+    } catch (caught) {
+      if (nameOcrSlotKeysRef.current[index] !== signature || nameOcrRequestIdsRef.current[index] !== requestId) {
+        return;
+      }
+      setLiveNameOcr((current) =>
+        updateNameOcrSlot(current, index, buildFailedNameOcrPreviewSlot(index, String(caught))),
+      );
     }
   }
 
@@ -642,6 +735,15 @@ function PlayerApp() {
         });
       });
     }
+  }
+
+  function clearCalibrationMarks() {
+    setMarks(() => emptyMarkState());
+    setActiveRegion("name-0");
+    setOcrReport(null);
+    setLiveNameOcr(buildEmptyNameOcrPreview());
+    nameOcrSlotKeysRef.current = [null, null, null];
+    nameOcrRequestIdsRef.current = [0, 0, 0];
   }
 
   function buildCalibrationInput(): CalibrationInput | null {
@@ -695,6 +797,7 @@ function PlayerApp() {
           readyToSave={readyToSave}
           ocrReport={ocrReport}
           nameOcrPreview={mergeNameOcrPreview(liveNameOcr, ocrReport)}
+          onClearMarks={clearCalibrationMarks}
           onRefreshMonitors={loadMonitors}
           onCapture={captureAfterDelay}
           onLoadLatestCapture={loadLatestCapture}
@@ -852,6 +955,7 @@ function CalibrationWizard({
   readyToSave,
   ocrReport,
   nameOcrPreview,
+  onClearMarks,
   onRefreshMonitors,
   onCapture,
   onLoadLatestCapture,
@@ -878,6 +982,7 @@ function CalibrationWizard({
   readyToSave: boolean;
   ocrReport: CalibratedNameOcrReport | null;
   nameOcrPreview: NameOcrPreviewSlot[];
+  onClearMarks: () => void;
   onRefreshMonitors: () => void;
   onCapture: () => void;
   onLoadLatestCapture: () => void;
@@ -996,10 +1101,7 @@ function CalibrationWizard({
             activeRegion={activeRegion}
             setActiveRegion={setActiveRegion}
             nameOcrPreview={nameOcrPreview}
-            onClear={() => {
-              setMarks(() => emptyMarkState());
-              setActiveRegion("name-0");
-            }}
+            onClear={onClearMarks}
           />
         </div>
       </article>
@@ -1208,14 +1310,23 @@ function RegionList({
       </div>
       <div className="ocr-preview-list">
         {nameOcrPreview.map((slot) => (
-          <article key={slot.slot} className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""}`}>
+          <article
+            key={slot.slot}
+            className={`ocr-preview-card ${slot.lowConfidence ? "warn" : ""} ${slot.status === "pending" ? "pending" : ""} ${slot.status === "error" ? "error" : ""}`}
+          >
             <div className="ocr-preview-head">
               <strong>{slotText[slot.slot]}</strong>
-              <span>{slot.source === "live" ? "实时 OCR" : slot.source === "ocr-check" ? "校验结果" : "待接线"}</span>
+              <span>
+                {slot.source === "live" ? "实时 OCR" : slot.source === "ocr-check" ? "校验结果" : "待接线"}
+              </span>
             </div>
-            <p>{slot.text ?? "等待名称 OCR 结果"}</p>
+            <p>
+              {slot.status === "pending" ? "正在预检名称区域..." : slot.text ?? "等待名称 OCR 结果"}
+            </p>
             <small>
-              {slot.confidence === null ? "置信度待返回" : `置信度 ${(slot.confidence * 100).toFixed(0)}%`}
+              {slot.status === "pending"
+                ? "完成框选后自动触发单区域 OCR 预检"
+                : formatNameOcrMetrics(slot)}
             </small>
             <em>{slot.hint ?? (slot.lowConfidence ? "低置信度，请复核名称框范围。" : "结果稳定后会在这里给出提示。")}</em>
           </article>
@@ -1245,30 +1356,149 @@ function RegionList({
 }
 
 function mergeNameOcrPreview(
-  liveNameOcr: NameOcrPreviewSlot[] | null,
+  liveNameOcr: NameOcrPreviewSlot[],
   ocrReport: CalibratedNameOcrReport | null,
 ): NameOcrPreviewSlot[] {
-  if (liveNameOcr && liveNameOcr.length > 0) {
-    return liveNameOcr;
+  const merged = liveNameOcr.map((slot) => ({ ...slot }));
+  if (!ocrReport) {
+    return merged;
   }
-  if (ocrReport) {
-    return ocrReport.slots.map((slot) => ({
+  ocrReport.slots.forEach((slot, index) => {
+    const current = merged[index];
+    if (current && current.status === "ready") {
+      return;
+    }
+    merged[index] = {
       slot: slot.slot,
       text: slot.finalName ?? (slot.rawText || null),
+      rawText: slot.rawText || null,
       confidence: slot.confidence,
+      matchScore: slot.matchScore,
       lowConfidence: slot.confidence < 0.75 || Boolean(slot.failureReason),
-      hint: slot.failureReason ?? (slot.confidence < 0.75 ? "置信度偏低，请复核名称框。" : "名称区域可用于后续实时展示。"),
+      hint:
+        slot.failureReason ??
+        (slot.confidence < 0.75
+          ? "置信度偏低，请调整到名称文字本体并避开边框。"
+          : "名称区域可用于后续实时展示。"),
       source: "ocr-check",
-    }));
-  }
-  return (["left", "center", "right"] as const).map((slot) => ({
-    slot,
+      status: "ready",
+    };
+  });
+  return merged;
+}
+
+function buildCalibrationSnapshot(marks: MarkState): string {
+  return JSON.stringify(marks);
+}
+
+function rectSignature(rect: PixelRect): string {
+  return `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
+}
+
+function buildEmptyNameOcrPreview(): NameOcrPreviewSlot[] {
+  return [0, 1, 2].map((index) => buildIdleNameOcrPreviewSlot(index)) as NameOcrPreviewSlot[];
+}
+
+function buildIdleNameOcrPreviewSlot(index: number): NameOcrPreviewSlot {
+  return {
+    slot: nameSlotAt(index),
     text: null,
+    rawText: null,
     confidence: null,
+    matchScore: null,
     lowConfidence: false,
-    hint: "预留给即时 OCR 与低置信度提示。",
+    hint: "名称框完成后会自动跑单区域 OCR 预检。",
     source: "placeholder",
-  }));
+    status: "idle",
+  };
+}
+
+function buildPendingNameOcrPreviewSlot(index: number): NameOcrPreviewSlot {
+  return {
+    ...buildIdleNameOcrPreviewSlot(index),
+    source: "live",
+    status: "pending",
+    hint: "正在根据当前名称框做 OCR 预检。",
+  };
+}
+
+function buildResolvedNameOcrPreviewSlot(
+  index: number,
+  report: NameRegionOcrPrecheckReport,
+): NameOcrPreviewSlot {
+  const isLowConfidence =
+    report.belowConfidenceThreshold || report.belowMatchThreshold || report.requiresUserAdjustment;
+  return {
+    slot: nameSlotAt(index),
+    text: report.finalName ?? (report.rawText || "未命中名称"),
+    rawText: report.rawText || null,
+    confidence: report.confidence,
+    matchScore: report.matchScore,
+    lowConfidence: isLowConfidence,
+    hint: buildNameOcrHint(report),
+    source: "live",
+    status: "ready",
+  };
+}
+
+function buildFailedNameOcrPreviewSlot(index: number, errorMessage: string): NameOcrPreviewSlot {
+  return {
+    slot: nameSlotAt(index),
+    text: "预检失败",
+    rawText: null,
+    confidence: null,
+    matchScore: null,
+    lowConfidence: true,
+    hint: `OCR 预检失败：${errorMessage}`,
+    source: "live",
+    status: "error",
+  };
+}
+
+function buildNameOcrHint(report: NameRegionOcrPrecheckReport): string {
+  if (report.requiresUserAdjustment || report.belowConfidenceThreshold || report.belowMatchThreshold) {
+    const reasons: string[] = [];
+    if (report.failureReason) {
+      reasons.push(report.failureReason);
+    }
+    if (report.belowConfidenceThreshold) {
+      reasons.push("置信度偏低");
+    }
+    if (report.belowMatchThreshold) {
+      reasons.push("匹配度偏低");
+    }
+    return `${reasons.join("，")}，请缩紧到名称文字并避开卡片边框、粒子和图标。`;
+  }
+  if (report.finalName) {
+    return "名称区域命中稳定，可以继续标记其他区域。";
+  }
+  return "未命中名称，请缩紧到名称文字并避开卡片装饰。";
+}
+
+function updateNameOcrSlot(
+  slots: NameOcrPreviewSlot[],
+  index: number,
+  nextSlot: NameOcrPreviewSlot,
+): NameOcrPreviewSlot[] {
+  return slots.map((slot, slotIndex) => (slotIndex === index ? nextSlot : slot));
+}
+
+function nameSlotAt(index: number): "left" | "center" | "right" {
+  return index === 0 ? "left" : index === 1 ? "center" : "right";
+}
+
+function formatNameOcrMetrics(slot: NameOcrPreviewSlot): string {
+  const parts: string[] = [];
+  if (slot.rawText) {
+    parts.push(`原文 ${slot.rawText}`);
+  }
+  if (slot.confidence !== null) {
+    parts.push(`置信度 ${(slot.confidence * 100).toFixed(0)}%`);
+  }
+  if (slot.matchScore !== null) {
+    parts.push(`匹配 ${slot.matchScore.toFixed(2)}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : "置信度待返回";
 }
 
 function OverlayPage() {
